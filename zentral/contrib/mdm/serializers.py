@@ -1,19 +1,93 @@
 import base64
+import logging
 import os
 from django.core.files import File
 from django.db import transaction
 from rest_framework import serializers
-from zentral.contrib.inventory.models import Tag
+from zentral.contrib.inventory.models import EnrollmentSecret, Tag
+from zentral.contrib.inventory.serializers import EnrollmentSecretSerializer
 from zentral.utils.os_version import make_comparable_os_version
+from zentral.utils.ssl import ensure_bytes
 from .app_manifest import download_package, read_package_info, validate_configuration
 from .artifacts import update_blueprint_serialized_artifacts
+from .crypto import generate_push_certificate_key_bytes, load_push_certificate_and_key
+from .dep import assign_dep_device_profile, DEPClientError
 from .models import (Artifact, ArtifactVersion, ArtifactVersionTag,
                      Blueprint, BlueprintArtifact, BlueprintArtifactTag,
-                     EnterpriseApp, FileVaultConfig,
-                     Platform, Profile,
+                     DEPDevice, DEPEnrollment,
+                     DeviceCommand,
+                     EnrolledDevice, EnterpriseApp, FileVaultConfig,
+                     Location, LocationAsset,
+                     OTAEnrollment,
+                     Platform, Profile, PushCertificate,
                      RecoveryPasswordConfig,
+                     SCEPConfig,
                      SoftwareUpdateEnforcement)
 from .payloads import get_configuration_profile_info
+from .scep.microsoft_ca import MicrosoftCAChallengeSerializer, OktaCAChallengeSerializer
+from .scep.static import StaticChallengeSerializer
+
+
+logger = logging.getLogger("zentral.contrib.mdm.serializers")
+
+
+class DeviceCommandSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DeviceCommand
+        fields = (
+            "id",
+            "uuid",
+            "enrolled_device",
+            "name",
+            "artifact_version",
+            "artifact_operation",
+            "not_before",
+            "time",
+            "result",
+            "result_time",
+            "status",
+            "error_chain",
+            "created_at",
+            "updated_at"
+        )
+
+
+class EnrolledDeviceSerializer(serializers.ModelSerializer):
+    os_version = serializers.CharField(source="current_os_version")
+    build_version = serializers.CharField(source="current_build_version")
+
+    class Meta:
+        model = EnrolledDevice
+        fields = (
+            "id",
+            "udid",
+            "serial_number",
+            "name",
+            "model",
+            "platform",
+            "os_version",
+            "build_version",
+            "apple_silicon",
+            "cert_not_valid_after",
+            "blueprint",
+            "awaiting_configuration",
+            "declarative_management",
+            "dep_enrollment",
+            "user_enrollment",
+            "user_approved_enrollment",
+            "supervised",
+            "bootstrap_token_escrowed",
+            "filevault_enabled",
+            "filevault_prk_escrowed",
+            "recovery_password_escrowed",
+            "activation_lock_manageable",
+            "last_seen_at",
+            "last_notified_at",
+            "checkout_at",
+            "blocked_at",
+            "created_at",
+            "updated_at",
+        )
 
 
 class ArtifactSerializer(serializers.ModelSerializer):
@@ -43,6 +117,127 @@ class FileVaultConfigSerializer(serializers.ModelSerializer):
         elif bypass_attempts > -1:
             raise serializers.ValidationError({"bypass_attempts": "Must be -1 when at_login_only is False"})
         return data
+
+
+class DEPDeviceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DEPDevice
+        fields = [
+            "id",
+            "virtual_server", "serial_number",
+            "asset_tag", "color",
+            "description", "device_family",
+            "model", "os",
+            "device_assigned_by", "device_assigned_date",
+            "last_op_type", "last_op_date",
+            "profile_status", "profile_uuid", "profile_push_time",
+            "enrollment",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "virtual_server", "serial_number",
+            "asset_tag", "color",
+            "description", "device_family",
+            "model", "os",
+            "device_assigned_by", "device_assigned_date",
+            "last_op_type", "last_op_date",
+            "profile_status", "profile_uuid", "profile_push_time",
+            "created_at", "updated_at",
+        ]
+
+    def update(self, instance, validated_data):
+        enrollment = validated_data.pop("enrollment")
+        try:
+            assign_dep_device_profile(instance, enrollment)
+        except DEPClientError:
+            logger.exception("Could not assign enrollment to device")
+            raise serializers.ValidationError({"enrollment": "Could not assign enrollment to device"})
+        else:
+            instance.enrollment = enrollment
+        return super().update(instance, validated_data)
+
+
+class OTAEnrollmentSerializer(serializers.ModelSerializer):
+    enrollment_secret = EnrollmentSecretSerializer(many=False)
+
+    class Meta:
+        model = OTAEnrollment
+        fields = "__all__"
+
+    def create(self, validated_data):
+        secret_data = validated_data.pop('enrollment_secret')
+        secret_tags = secret_data.pop("tags", [])
+        secret = EnrollmentSecret.objects.create(**secret_data)
+        if secret_tags:
+            secret.tags.set(secret_tags)
+        return OTAEnrollment.objects.create(enrollment_secret=secret, **validated_data)
+
+    def update(self, instance, validated_data):
+        secret_serializer = self.fields["enrollment_secret"]
+        secret_data = validated_data.pop('enrollment_secret')
+        secret_serializer.update(instance.enrollment_secret, secret_data)
+        return super().update(instance, validated_data)
+
+
+class PushCertificateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PushCertificate
+        fields = (
+            "id",
+            "provisioning_uid",
+            "name",
+            "topic",
+            "not_before",
+            "not_after",
+            "certificate",
+            "created_at",
+            "updated_at"
+        )
+
+    def to_internal_value(self, data):
+        # We need to implement this to keep the certificate
+        # and apply it only if it is provided in the uploaded data.
+        # There is no reason to nullify the certificate!
+        certificate = data.pop("certificate", None)
+        data = super().to_internal_value(data)
+        if certificate:
+            data["certificate"] = certificate
+        return data
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if instance.certificate:
+            ret["certificate"] = ensure_bytes(instance.certificate).decode("ascii")
+        return ret
+
+    def validate(self, data):
+        certificate = data.pop("certificate", None)
+        if certificate:
+            if not self.instance:
+                raise serializers.ValidationError("Certificate cannot be set when creating a push certificate")
+            try:
+                push_certificate_d = load_push_certificate_and_key(
+                    certificate,
+                    self.instance.get_private_key(),
+                )
+            except ValueError as e:
+                raise serializers.ValidationError(str(e))
+            if self.instance.topic:
+                if push_certificate_d["topic"] != self.instance.topic:
+                    raise serializers.ValidationError("The new certificate has a different topic")
+            else:
+                if PushCertificate.objects.filter(topic=push_certificate_d["topic"]).exists():
+                    raise serializers.ValidationError("A different certificate with the same topic already exists")
+            push_certificate_d.pop("private_key")
+            data.update(push_certificate_d)
+        return data
+
+    def create(self, validated_data):
+        instance = super().create(validated_data)
+        instance.set_private_key(generate_push_certificate_key_bytes())
+        instance.save()
+        return instance
 
 
 class RecoveryPasswordConfigSerializer(serializers.ModelSerializer):
@@ -92,6 +287,73 @@ class RecoveryPasswordConfigSerializer(serializers.ModelSerializer):
         instance.set_static_password(static_password)
         instance.save()
         return instance
+
+
+class SCEPConfigSerializer(serializers.ModelSerializer):
+    microsoft_ca_challenge_kwargs = MicrosoftCAChallengeSerializer(
+        source="get_microsoft_ca_challenge_kwargs",
+        required=False,
+    )
+    okta_ca_challenge_kwargs = OktaCAChallengeSerializer(
+        source="get_okta_ca_challenge_kwargs",
+        required=False,
+    )
+    static_challenge_kwargs = StaticChallengeSerializer(
+        source="get_static_challenge_kwargs",
+        required=False,
+    )
+
+    class Meta:
+        model = SCEPConfig
+        fields = (
+            "id",
+            "provisioning_uid",
+            "name",
+            "url",
+            "key_usage",
+            "key_is_extractable",
+            "keysize",
+            "allow_all_apps_access",
+            "challenge_type",
+            "microsoft_ca_challenge_kwargs",
+            "okta_ca_challenge_kwargs",
+            "static_challenge_kwargs",
+            "created_at",
+            "updated_at",
+        )
+
+    def validate(self, data):
+        data = super().validate(data)
+        challenge_type = data.get("challenge_type")
+        if challenge_type:
+            field_name = f"{challenge_type.lower()}_challenge_kwargs"
+            data["challenge_kwargs"] = data.pop(f"get_{field_name}", {})
+            if not data["challenge_kwargs"]:
+                raise serializers.ValidationError({field_name: "This field is required."})
+        return data
+
+    def create(self, validated_data):
+        challenge_kwargs = validated_data.pop("challenge_kwargs", {})
+        validated_data["challenge_kwargs"] = {}
+        scep_config = super().create(validated_data)
+        scep_config.set_challenge_kwargs(challenge_kwargs)
+        scep_config.save()
+        return scep_config
+
+    def update(self, instance, validated_data):
+        challenge_kwargs = validated_data.pop("challenge_kwargs", {})
+        scep_config = super().update(instance, validated_data)
+        scep_config.set_challenge_kwargs(challenge_kwargs)
+        scep_config.save()
+        return scep_config
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if instance.provisioning_uid:
+            for field in list(ret.keys()):
+                if "challenge" in field:
+                    ret.pop(field)
+        return ret
 
 
 class SoftwareUpdateEnforcementSerializer(serializers.ModelSerializer):
@@ -452,3 +714,27 @@ class EnterpriseAppSerializer(ArtifactVersionSerializer):
         finally:
             os.unlink(validated_data["enterprise_app"]["package"].name)
         return instance
+
+
+class LocationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Location
+        fields = (
+            "id",
+            "server_token_expiration_date",
+            "organization_name",
+            "name",
+            "country_code",
+            "library_uid",
+            "platform",
+            "website_url",
+            "mdm_info_id",
+            "created_at",
+            "updated_at",
+        )
+
+
+class LocationAssetSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LocationAsset
+        fields = "__all__"

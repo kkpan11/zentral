@@ -1,13 +1,8 @@
-# OneLogin - SAML integration
-
-This is a quick guide to help integrate [OneLogin](https://www.onelogin.com/) with Zentral.
-
-In Zentral, identity providers (IdP) are configured using realms. There are three kinds of realm: SAML, OIDC, and LDAP. In this case, we will use a SAML realm.
+# OneLogin - SAML Setup
 
 We will start by setting up an OneLogin application. We will then configure a Zentral realm for this application. Finally, we will update the OneLogin application configuration, and configure the Zentral mappings.
 
 ## Create a OneLogin application
-
 
 ### SAML application
 
@@ -78,21 +73,8 @@ Set the following fields in the `Parameters` tab of the OneLogin app:
 
 In Zentral, click on the `Update` button in the realm detail view, and upload the metadata file.
 
-### Configure the group mappings
+Check that everything works: click the 'Test' button (icon to the right of the realm name) on the Zentral Realm detail page. It will trigger an authentication with the IdP and display the claims Zentral receives with their mappings.
 
-We need to map the `Default` and `Admin` OneLogin application roles to Zentral groups.
+## Role Base Access Control (RBAC)
 
-In Zentral, go to `Setup > Groups` and make sure you have two groups corresponding to the two roles in OneLogin. Set the permissions of each group in Zentral according to your requirements. You could of course add more roles in OneLogin and map them to more Zentral groups.
-
-Go back to the realm detail view. For each role in OneLogin, we need to create a realm group mapping in Zentral:
-
-|Zentral group mapping attribute|Value|
-|---|---|
-|Claim|roles|
-|Separator|`;`|
-|Value|name of the application role in OneLogin|
-|Group|Zentral group|
-
-### Test the realm
-
-Use the `🕶️ Test` button in the Zentral realm detail view to test the mapping of the claims/parameters and roles/groups. It will redirect you to OneLogin and then display the OneLogin information sent to Zentral, and the mappings.
+See [Realm Group and Roles setup](/configuration/sso/#realm-groups) for more information.

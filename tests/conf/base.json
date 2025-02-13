@@ -117,6 +117,7 @@
     "zentral.core.incidents": {
       "metrics": true
     },
+    "zentral.core.terraform": {},
     "zentral.contrib.inventory": {
       "metrics": true,
       "clients": [
@@ -146,9 +147,31 @@
       ]
     },
     "zentral.contrib.jamf": {},
-    "zentral.contrib.jamf_protect": {},
     "zentral.contrib.mdm": {
-      "scep_ca_fullchain": "NOT_A_VALID_CERT"
+      "scep_ca_fullchain": "NOT_A_VALID_CERT",
+      "push_csr_signer": {
+        "backend": "zentral.contrib.mdm.push_csr_signers.ZentralSaaSPushCSRSigner",
+        "url": "https://www.example.com/api/"
+      },
+      "provisioning": {
+        "push_certificates": {
+            "Default": {
+              "name": "Default"
+            }
+        },
+        "scep_configs": {
+          "test": {
+            "name": "YoloFomo",
+            "url": "https://www.example.com/scep/",
+            "challenge_type": "MICROSOFT_CA",
+            "microsoft_ca_challenge_kwargs": {
+              "url": "https://www.example.com/ndes/",
+              "username": "Yolo",
+              "password": "Fomo"
+            }
+          }
+        }
+      }
     },
     "zentral.contrib.munki": {
       "metrics": true
@@ -168,9 +191,16 @@
           ],
           "optional": true
         }
+      },
+      "provisioning": {
+        "repositories": {
+          "test": {
+            "name": "YoloFomo",
+            "backend": "VIRTUAL"
+          }
+        }
       }
     },
-    "zentral.contrib.okta": {},
     "zentral.contrib.osquery": {},
     "zentral.contrib.puppet": {
       "instances": [
@@ -190,10 +220,10 @@
       ]
     },
     "zentral.contrib.santa": {
-      "metrics": true
+      "metrics": true,
+      "user_portal": true
     },
     "zentral.contrib.wsone": {},
-    "zentral.contrib.intune": {},
-    "zentral.contrib.zendesk": {}
+    "zentral.contrib.intune": {}
   }
 }

@@ -2,12 +2,12 @@
 
 asn1crypto                      # MDM, mTLS, SCEP
 azure-identity
+azure-storage-blob
 boto3                           # conf, monolith, events (kinesis, sns/sqs)
 celery<6
 django-celery-results==2.4.0
 cryptography                    # MDM, monolith (cloudfront), munki
 defusedxml
-django-bootstrap-form
 django>=4.2.8,<5
 djangorestframework
 djangorestframework-yaml

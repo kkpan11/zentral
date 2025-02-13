@@ -5,7 +5,7 @@ from django.utils.functional import SimpleLazyObject
 
 def load_yaml():
     return yaml.safe_load(
-        open(os.path.join(os.path.dirname(__file__), "schema_data/skipkeys.yaml"), "r")
+        open(os.path.join(os.path.dirname(__file__), "schema_data/other/skipkeys.yaml"), "r")
     )
 
 
@@ -13,7 +13,7 @@ def build_skippable_setup_panes():
     skipkeys = load_yaml()
     skippable_setup_panes = []
     for payloadkey in skipkeys["payloadkeys"]:
-        skippable_setup_panes.append((payloadkey["key"], payloadkey["content"]))
+        skippable_setup_panes.append((payloadkey["key"], payloadkey["title"]))
     return skippable_setup_panes
 
 

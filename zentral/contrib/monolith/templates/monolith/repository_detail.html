@@ -16,7 +16,22 @@
     <div class="d-flex align-items-center mb-3">
         <h3 class="m-0 fs-5 text-secondary">Repository</h3>
         <div class="ms-auto">
-            {% if perms.monolith.change_repository %}
+            {% if perms.monolith.sync_repository %}
+            <form method="post"
+                  action="{% url 'monolith:sync_repository' object.pk %}"
+                  style="display:inline">
+              {% csrf_token %}
+              <button type="submit"
+                      class="btn btn-link"
+                      value="Sync Monolith repository"
+                      data-bs-toggle="tooltip"
+                      data-bs-placement="bottom"
+                      data-bs-title="Sync Monolith repository">
+                <i class="bi bi-arrow-counterclockwise"></i>
+              </button>
+            </form>
+            {% endif %}
+            {% if perms.monolith.change_repository  and object.can_be_updated %}
                 {% url 'monolith:update_repository' object.pk as url %}
                 {% button 'UPDATE' url "Edit Monolith repository" %}
             {% endif %}
@@ -47,6 +62,7 @@
         {% endif %}
       </td>
     </tr>
+    {% if not object.provisioning_uid %}
     <tr>
       <td>Backend</td>
       <td>
@@ -54,6 +70,31 @@
           <dt>Type</dt>
           <dd>{{ object.get_backend_display }}</dd>
           {% with object.get_backend_kwargs as kwargs %}
+          {% if object.backend == "AZURE" %}
+          <dt>Storage account</dt>
+          <dd>{{ kwargs.storage_account }}</dd>
+          <dt>Container</dt>
+          <dd>{{ kwargs.container }}</dd>
+          {% if kwargs.prefix %}
+          <dt>Prefix</dt>
+          <dd>{{ kwargs.prefix }}</dd>
+          {% endif %}
+          {% if kwargs.client_id %}
+          <dt>Client ID</dt>
+          <dd><code>{{ kwargs.client_id }}</code></dd>
+          {% endif %}
+          {% if kwargs.tenant_id %}
+          <dt>Tenant ID</dt>
+          <dd><code>{{ kwargs.tenant_id }}</code></dd>
+          {% endif %}
+          {% if kwargs.client_secret %}
+          <dt>Client secret</dt>
+          <dd>
+            <span class="bi bi-eye" aria-hidden="true" style="cursor:pointer"></span>
+            <span hidden>{{ kwargs.client_secret }}</span>
+          </dd>
+          {% endif %}
+          {% endif %}
           {% if object.backend == "S3" %}
           <dt>Bucket</dt>
           <dd>{{ kwargs.bucket }}</dd>
@@ -108,6 +149,7 @@
         </dl>
       </td>
     </tr>
+    {% endif %}
     <tr>
       <td>Catalog{{ catalogs|length|pluralize }} ({{ catalogs|length }})</td>
       <td>
@@ -129,7 +171,7 @@
       </td>
     </tr>
     <tr>
-      <td>Icon hashe{{  object.icon_hashes|length|pluralize }}</td>
+      <td>Icon hash{{  object.icon_hashes|length|pluralize:",es" }}</td>
       <td>{{ object.icon_hashes|length }}</td>
     </tr>
     <tr>

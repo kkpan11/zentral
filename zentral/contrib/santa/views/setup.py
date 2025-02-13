@@ -2,24 +2,27 @@ import logging
 from urllib.parse import urlencode
 from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.db import transaction
-from django.http import HttpResponseRedirect
+from django.http import Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
-from django.urls import reverse
+from django.urls import reverse, reverse_lazy
 from django.views.generic import DetailView, TemplateView, View
 from django.views.generic.edit import DeleteView, FormView, UpdateView
 from zentral.contrib.inventory.forms import EnrollmentSecretForm
 from zentral.contrib.inventory.models import Certificate, File
 from zentral.contrib.santa.events import post_santa_rule_update_event
-from zentral.contrib.santa.forms import (BinarySearchForm, BundleSearchForm, CertificateSearchForm,
+from zentral.contrib.santa.forms import (BinarySearchForm,
+                                         CDHashSearchForm, CertificateSearchForm,
                                          TeamIDSearchForm, SigningIDSearchForm,
-                                         ConfigurationForm, EnrollmentForm, RuleForm, RuleSearchForm, UpdateRuleForm)
-from zentral.contrib.santa.models import Bundle, Configuration, Rule, Target
+                                         ConfigurationForm, EnrollmentForm,
+                                         VotingGroupForm,
+                                         RuleForm, RuleSearchForm, UpdateRuleForm)
+from zentral.contrib.santa.models import Configuration, Enrollment, Rule, Target, VotingGroup
 from zentral.contrib.santa.terraform import iter_resources
 from zentral.core.stores.conf import frontend_store, stores
 from zentral.core.stores.views import EventsView, FetchEventsView, EventsStoreRedirectView
 from zentral.utils.terraform import build_config_response
 from zentral.utils.text import encode_args
-from zentral.utils.views import CreateViewWithAudit, UpdateViewWithAudit, UserPaginationListView
+from zentral.utils.views import CreateViewWithAudit, DeleteViewWithAudit, UpdateViewWithAudit, UserPaginationListView
 
 
 logger = logging.getLogger('zentral.contrib.santa.views.setup')
@@ -59,9 +62,10 @@ class ConfigurationView(PermissionRequiredMixin, DetailView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        enrollments = list(self.object.enrollment_set.select_related("secret").all().order_by("id"))
-        ctx["enrollments"] = enrollments
-        ctx["enrollments_count"] = len(enrollments)
+        if self.request.user.has_perm("santa.view_enrollment"):
+            enrollments = list(self.object.enrollment_set.select_related("secret").all().order_by("id"))
+            ctx["enrollments"] = enrollments
+            ctx["enrollments_count"] = len(enrollments)
         ctx["rules_count"] = self.object.rule_set.count()
         if self.request.user.has_perms(
             ("santa.view_configuration",
@@ -79,6 +83,11 @@ class ConfigurationView(PermissionRequiredMixin, DetailView):
                 )
                 store_links.append((url, store.name))
             ctx["store_links"] = store_links
+        ctx["voting_groups"] = list(
+            self.object.votinggroup_set
+                       .select_related("realm_group")
+                       .order_by("realm_group__display_name")
+        )
         return ctx
 
 
@@ -134,6 +143,64 @@ class UpdateConfigurationView(PermissionRequiredMixin, UpdateViewWithAudit):
     form_class = ConfigurationForm
 
 
+class DeleteConfigurationView(PermissionRequiredMixin, DeleteViewWithAudit):
+    permission_required = "santa.delete_configuration"
+    model = Configuration
+    success_url = reverse_lazy("santa:configuration_list")
+
+    def get_queryset(self):
+        return self.model.objects.for_deletion()
+
+
+# voting groups
+
+
+class CreateVotingGroupView(PermissionRequiredMixin, CreateViewWithAudit):
+    permission_required = "santa.add_votinggroup"
+    model = VotingGroup
+    form_class = VotingGroupForm
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs["configuration"] = get_object_or_404(Configuration, pk=self.kwargs["configuration_pk"])
+        return kwargs
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx["title"] = "Create voting group"
+        return ctx
+
+
+class UpdateVotingGroupView(PermissionRequiredMixin, UpdateViewWithAudit):
+    permission_required = "santa.change_votinggroup"
+    model = VotingGroup
+    form_class = VotingGroupForm
+
+    def get_queryset(self):
+        return super().get_queryset().filter(configuration__pk=self.kwargs["configuration_pk"])
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs["configuration"] = self.object.configuration
+        return kwargs
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx["title"] = "Update voting group"
+        return ctx
+
+
+class DeleteVotingGroupView(PermissionRequiredMixin, DeleteViewWithAudit):
+    permission_required = "santa.delete_votinggroup"
+    model = VotingGroup
+
+    def get_success_url(self):
+        return reverse("santa:configuration", args=(self.object.configuration.pk,))
+
+
+# enrollments
+
+
 class CreateEnrollmentView(PermissionRequiredMixin, TemplateView):
     permission_required = "santa.add_enrollment"
     template_name = "santa/enrollment_form.html"
@@ -181,6 +248,27 @@ class CreateEnrollmentView(PermissionRequiredMixin, TemplateView):
             return self.forms_invalid(secret_form, enrollment_form)
 
 
+class DeleteEnrollmentView(PermissionRequiredMixin, DeleteViewWithAudit):
+    permission_required = "santa.delete_enrollment"
+    model = Enrollment
+
+    def get_queryset(self):
+        return self.model.objects.select_related(
+            "configuration"
+        ).filter(
+            configuration__pk=self.kwargs["configuration_pk"]
+        )
+
+    def get_object(self):
+        obj = super().get_object()
+        if not obj.can_be_deleted():
+            raise Http404
+        return obj
+
+    def get_success_url(self):
+        return self.object.configuration.get_absolute_url()
+
+
 # rules
 
 
@@ -216,14 +304,15 @@ class CreateConfigurationRuleView(PermissionRequiredMixin, FormView):
 
     def dispatch(self, request, *args, **kwargs):
         self.configuration = get_object_or_404(Configuration, pk=kwargs["configuration_pk"])
-        self.binary = self.bundle = self.certificate = self.team_id = self.signing_id = None
+        self.binary = self.bundle = self.cdhash = self.certificate = None
+        self.metabundle = self.team_id = self.signing_id = None
         try:
             self.binary = File.objects.get(pk=self.request.GET["bin"])
         except (KeyError, File.DoesNotExist):
             pass
         try:
-            self.bundle = Bundle.objects.select_related("target").get(pk=self.request.GET["bun"])
-        except (KeyError, Bundle.DoesNotExist):
+            self.cdhash = self.request.GET["cdhash"]
+        except KeyError:
             pass
         try:
             self.certificate = Certificate.objects.get(pk=self.request.GET["cert"])
@@ -243,7 +332,7 @@ class CreateConfigurationRuleView(PermissionRequiredMixin, FormView):
         kwargs = super().get_form_kwargs()
         kwargs["configuration"] = self.configuration
         kwargs["binary"] = self.binary
-        kwargs["bundle"] = self.bundle
+        kwargs["cdhash"] = self.cdhash
         kwargs["certificate"] = self.certificate
         kwargs["team_id"] = self.team_id
         kwargs["signing_id"] = self.signing_id
@@ -259,11 +348,13 @@ class CreateConfigurationRuleView(PermissionRequiredMixin, FormView):
             ctx["title"] = "Add Santa binary rule"
         else:
             ctx["files"] = []
-        if self.bundle:
-            ctx['bundle'] = self.bundle
-            ctx['target_type_display'] = "Bundle"
-            ctx['target_identifier'] = self.bundle.target.identifier
-            ctx["title"] = "Add Santa bundle rule"
+        if self.cdhash:
+            ctx['cdhashes'] = Target.objects.get_cdhash_objects(self.cdhash)
+            ctx['target_type_display'] = "cdhash"
+            ctx['target_identifier'] = self.cdhash
+            ctx['title'] = "Add Santa cdhash rule"
+        else:
+            ctx["cdhashes"] = []
         if self.certificate:
             ctx['certificates'] = [self.certificate]
             ctx['target_type_display'] = "Certificate"
@@ -303,7 +394,8 @@ class UpdateConfigurationRuleView(PermissionRequiredMixin, UpdateView):
             Rule.objects.select_related("configuration", "target"),
             pk=self.kwargs["pk"],
             configuration__pk=self.kwargs["configuration_pk"],
-            ruleset__isnull=True
+            ruleset__isnull=True,
+            is_voting_rule=False,
         )
 
     def get_context_data(self, **kwargs):
@@ -331,7 +423,8 @@ class DeleteConfigurationRuleView(PermissionRequiredMixin, DeleteView):
             Rule.objects.select_related("configuration", "target"),
             pk=self.kwargs["pk"],
             configuration__pk=self.kwargs["configuration_pk"],
-            ruleset__isnull=True
+            ruleset__isnull=True,
+            is_voting_rule=False,
         )
 
     def get_context_data(self, **kwargs):
@@ -368,36 +461,10 @@ class PickRuleBinaryView(PermissionRequiredMixin, TemplateView):
             rule.target.identifier: rule
             for rule in Rule.objects.select_related("target")
                                     .filter(configuration=self.configuration,
-                                            target__type=Target.BINARY,
+                                            target__type=Target.Type.BINARY,
                                             target__identifier__in=[binary.sha_256 for binary in binaries])
         }
         ctx['binaries'] = [(binary, existing_rules.get(binary.sha_256)) for binary in binaries]
-        ctx['form'] = form
-        return ctx
-
-
-class PickRuleBundleView(PermissionRequiredMixin, TemplateView):
-    permission_required = "santa.add_rule"
-    template_name = "santa/pick_rule_bundle.html"
-
-    def dispatch(self, request, *args, **kwargs):
-        self.configuration = get_object_or_404(Configuration, pk=kwargs["configuration_pk"])
-        return super().dispatch(request, *args, **kwargs)
-
-    def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        ctx["configuration"] = self.configuration
-        form = BundleSearchForm(self.request.GET)
-        form.is_valid()
-        bundles = list(Bundle.objects.search(**form.cleaned_data))
-        existing_rules = {
-            rule.target.identifier: rule
-            for rule in Rule.objects.select_related("target")
-                                    .filter(configuration=self.configuration,
-                                            target__type=Target.BUNDLE,
-                                            target__identifier__in=[bundle.target.identifier for bundle in bundles])
-        }
-        ctx['bundles'] = [(bundle, existing_rules.get(bundle.target.identifier)) for bundle in bundles]
         ctx['form'] = form
         return ctx
 
@@ -420,7 +487,7 @@ class PickRuleCertificateView(PermissionRequiredMixin, TemplateView):
             rule.target.identifier: rule
             for rule in Rule.objects.select_related("target")
                                     .filter(configuration=self.configuration,
-                                            target__type=Target.CERTIFICATE,
+                                            target__type=Target.Type.CERTIFICATE,
                                             target__identifier__in=[certificate.sha_256
                                                                     for certificate in certificates])
         }
@@ -447,11 +514,38 @@ class PickRuleTeamIDView(PermissionRequiredMixin, TemplateView):
             rule.target.identifier: rule
             for rule in Rule.objects.select_related("target")
                                     .filter(configuration=self.configuration,
-                                            target__type=Target.TEAM_ID,
+                                            target__type=Target.Type.TEAM_ID,
                                             target__identifier__in=[team_id.organizational_unit
                                                                     for team_id in team_ids])
         }
         ctx['team_ids'] = [(team_id, existing_rules.get(team_id.organizational_unit)) for team_id in team_ids]
+        ctx['form'] = form
+        return ctx
+
+
+class PickRuleCDHashView(PermissionRequiredMixin, TemplateView):
+    permission_required = "santa.add_rule"
+    template_name = "santa/pick_rule_cdhash.html"
+
+    def dispatch(self, request, *args, **kwargs):
+        self.configuration = get_object_or_404(Configuration, pk=kwargs["configuration_pk"])
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx["configuration"] = self.configuration
+        form = CDHashSearchForm(self.request.GET)
+        form.is_valid()
+        cdhashes = Target.objects.search_cdhash_objects(**form.cleaned_data)
+        existing_rules = {
+            rule.target.identifier: rule
+            for rule in Rule.objects.select_related("target")
+                                    .filter(configuration=self.configuration,
+                                            target__type=Target.Type.CDHASH,
+                                            target__identifier__in=[cdhash.cdhash
+                                                                    for cdhash in cdhashes])
+        }
+        ctx['cdhashes'] = [(cdhash, existing_rules.get(cdhash.cdhash)) for cdhash in cdhashes]
         ctx['form'] = form
         return ctx
 
@@ -474,7 +568,7 @@ class PickRuleSigningIDView(PermissionRequiredMixin, TemplateView):
             rule.target.identifier: rule
             for rule in Rule.objects.select_related("target")
                                     .filter(configuration=self.configuration,
-                                            target__type=Target.SIGNING_ID,
+                                            target__type=Target.Type.SIGNING_ID,
                                             target__identifier__in=[signing_id.signing_id
                                                                     for signing_id in signing_ids])
         }

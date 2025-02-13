@@ -246,34 +246,37 @@ def macos_version_from_build(build):
             minor = patch
             if build in ("21A558", "21A559", "21D62", "21E258", "21G83", "21G217", "21G920",
                          "22A400", "22D68", "22E261", "22E772610a", "22F82", "22F770820b", "22F770820d",
-                         "22G90", "22G313",
-                         "23B81", "23B2082", "23C71", "23D60"):
+                         "22G90", "22G313", "22H221",
+                         "23B81", "23B2082", "23C71", "23D60", "23G93", "23H222",
+                         "24A348", "24B91", "24D70"):
                 patch = 1
             elif build in ("21G309", "21G320", "21G1974",
-                           "22G91", "22G320",
-                           "23B2091", "23B92"):
+                           "22G91", "22G320", "22H313",
+                           "23B2091", "23B92", "23H311"):
                 patch = 2
-            elif build in ("21G417", "21G419", "21H1015", "22G436"):
+            elif build in ("21G417", "21G419", "21H1015",
+                           "22G436", "22H417",
+                           "23H417"):
                 patch = 3
-            elif build in ("21G526", "22G513", "21H1123"):
+            elif build in ("21G526", "21H1123", "22G513"):
                 patch = 4
-            elif build in ("21G531", "22G621"):
+            elif build in ("21G531", "21H1222", "22G621"):
                 patch = 5
-            elif build == "21G646":
+            elif build in ("21G646", "21H1320", "22G630"):
                 patch = 6
-            elif build == "21G651":
+            elif build in ("21G651", "22G720"):
                 patch = 7
-            elif build == "21G725":
+            elif build in ("21G725", "22G820"):
                 patch = 8
-            elif build == "21G726":
+            elif build in ("21G726", "22G830"):
                 patch = 9
             else:
                 patch = 0
-            if patch_letter >= "G" and patch_number >= 816:
+            if patch_letter >= "G" and major == 12 and patch_number >= 816:
                 minor = 7
-            elif patch_letter >= "G" and patch_number >= 115:
+            elif patch_letter == "G" and major in (12, 13) and patch_number >= 115:
                 minor = 6
-            elif minor > 0 and major < 14:
+            elif patch_letter < "H" and minor > 0 and major < 14:
                 minor -= 1
         elif minor == 16:
             major = 11

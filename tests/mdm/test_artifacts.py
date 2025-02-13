@@ -17,7 +17,8 @@ from zentral.contrib.mdm.models import (Asset, Artifact, ArtifactVersion, Artifa
                                         Platform, Profile, PushCertificate,
                                         StoreApp, TargetArtifact,
                                         UserArtifact)
-from .utils import (force_software_update, force_software_update_enforcement,
+from .utils import (force_artifact, force_blueprint_artifact,
+                    force_software_update, force_software_update_enforcement,
                     MACOS_13_CLIENT_CAPABILITIES, MACOS_14_CLIENT_CAPABILITIES)
 
 
@@ -244,13 +245,16 @@ class TestMDMArtifacts(TestCase):
         )
         configurations = status_report["StatusItems"]["management"]["declarations"]["configurations"]
         configurations.pop()
-        for artifact_version, valid, active in extra_configurations:
-            configurations.append({
+        for artifact_version, valid, active, reasons in extra_configurations:
+            configuration = {
                 "valid": "valid" if valid else "invalid",
                 "active": active,
                 "identifier": f"zentral.legacy-profile.{artifact_version.artifact.pk}",
                 "server-token": str(artifact_version.pk),
-            })
+            }
+            if reasons:
+                configuration["reasons"] = reasons
+            configurations.append(configuration)
         return status_report
 
     # default platforms
@@ -838,6 +842,47 @@ class TestMDMArtifacts(TestCase):
         self.assertIn(f"zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions", scs)
         self.assertIn(f"zentral.blueprint.{self.blueprint1.pk}.softwareupdate-enforcement-specific", scs)
 
+    def test_device_activation_manual_config_not_included(self):
+        artifact, _ = force_artifact(artifact_type=Artifact.Type.MANUAL_CONFIGURATION)
+        force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.ACTIVATION,
+            decl_type="com.apple.activation.simple",
+            decl_payload={
+                "StandardConfigurations": [f"ztl:{artifact.pk}"],
+            }
+        )
+        target = Target(self.enrolled_device)
+        activation = target.activation
+        activation.pop("ServerToken")
+        self.assertEqual(
+            activation,
+            {'Identifier': f'zentral.blueprint.{self.blueprint1.pk}.activation',
+             'Payload': {'StandardConfigurations': [
+                             f'zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions']},
+             'Type': 'com.apple.activation.simple'}
+        )
+
+    def test_device_activation_config_included(self):
+        _, artifact, _ = force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.CONFIGURATION,
+        )
+        target = Target(self.enrolled_device)
+        activation = target.activation
+        activation.pop("ServerToken")
+        self.assertEqual(
+            activation,
+            {'Identifier': f'zentral.blueprint.{self.blueprint1.pk}.activation',
+             'Payload': {'StandardConfigurations': [
+                             f'zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions',
+                             f'zentral.declaration.{artifact.pk}',
+                          ]},
+             'Type': 'com.apple.activation.simple'}
+        )
+
+    # declaration items
+
     def test_user_declaration_items_enterprise_app_not_included(self):
         _, profile_a, (profile_av,) = self._force_blueprint_artifact(channel=Channel.USER)
         profile_a.reinstall_on_os_update = Artifact.ReinstallOnOSUpdate.PATCH
@@ -919,6 +964,49 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(configurations[1]["Identifier"],
                          f"zentral.blueprint.{self.blueprint1.pk}.softwareupdate-enforcement-specific")
         self.assertEqual(configurations[1]["ServerToken"], "724edaf760e7d7282084dcf3eaef6467447accd1")
+
+    def test_device_declaration_items_config_and_dep_included(self):
+        artifact, (artifact_version,) = force_artifact(artifact_type=Artifact.Type.DATA_ASSET)
+        _, parent_artifact, _ = force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.CONFIGURATION,
+            decl_type="com.apple.configuration.services.configuration-files",
+            decl_payload={
+                "ServiceType": "com.apple.sudo",
+                "DataAssetReference": f"ztl:{artifact.pk}",
+            },
+        )
+        target = Target(self.enrolled_device)
+        declarations = target.declaration_items["Declarations"]
+        self.assertEqual(set(d['Identifier'] for d in declarations["Activations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.activation"})
+        self.assertEqual(set(d['Identifier'] for d in declarations["Assets"]),
+                         {f"zentral.data-asset.{artifact.pk}"})
+        self.assertEqual(set(d['Identifier'] for d in declarations["Configurations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions",
+                          f"zentral.declaration.{parent_artifact.pk}"})
+        self.assertEqual(len(declarations["Management"]), 0)
+
+    def test_device_declaration_items_activation_and_dep_included(self):
+        artifact, _ = force_artifact(artifact_type=Artifact.Type.MANUAL_CONFIGURATION)
+        _, parent_artifact, _ = force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.ACTIVATION,
+            decl_type="com.apple.activation.simple",
+            decl_payload={
+                "StandardConfigurations": [f"ztl:{artifact.pk}"],
+            }
+        )
+        target = Target(self.enrolled_device)
+        declarations = target.declaration_items["Declarations"]
+        self.assertEqual(set(d['Identifier'] for d in declarations["Activations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.activation",
+                          f"zentral.declaration.{parent_artifact.pk}"})
+        self.assertEqual(len(declarations["Assets"]), 0)
+        self.assertEqual(set(d['Identifier'] for d in declarations["Configurations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions",
+                          f"zentral.declaration.{artifact.pk}"})
+        self.assertEqual(len(declarations["Management"]), 0)
 
     # update_target_artifact
 
@@ -1260,7 +1348,7 @@ class TestMDMArtifacts(TestCase):
     def test_update_target_artifacts_from_status_report_installed(self, patched_datetime):
         patched_datetime.utcnow.return_value = datetime(2001, 2, 3, 4, 5, 6)
         _, profile_a, (profile_av,) = self._force_blueprint_artifact()
-        status_report = self._build_status_report([(profile_av, True, True)])
+        status_report = self._build_status_report([(profile_av, True, True, None)])
         self.enrolled_device.os_version = "10.5.2"
         target = Target(self.enrolled_device)
         self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
@@ -1274,7 +1362,7 @@ class TestMDMArtifacts(TestCase):
     def test_update_target_artifacts_from_status_report_uninstalled(self, patched_datetime):
         patched_datetime.utcnow.return_value = datetime(2001, 2, 3, 4, 5, 6)
         _, profile_a, (profile_av,) = self._force_blueprint_artifact()
-        status_report = self._build_status_report([(profile_av, True, False)])
+        status_report = self._build_status_report([(profile_av, True, False, None)])
         self.enrolled_device.os_version = "10.5.2"
         target = Target(self.enrolled_device)
         self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
@@ -1288,7 +1376,10 @@ class TestMDMArtifacts(TestCase):
     def test_update_target_artifacts_from_status_report_failed(self, patched_datetime):
         patched_datetime.utcnow.return_value = datetime(2001, 2, 3, 4, 5, 6)
         _, profile_a, (profile_av,) = self._force_blueprint_artifact()
-        status_report = self._build_status_report([(profile_av, False, False)])
+        reasons = [{"details": {"Error": "Yolo Fomo"},
+                    "description": "Configuration cannot be applied",
+                    "code": "Error.ConfigurationCannotBeApplied"}]
+        status_report = self._build_status_report([(profile_av, False, True, reasons)])
         self.enrolled_device.os_version = "10.5.2"
         target = Target(self.enrolled_device)
         self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
@@ -1296,6 +1387,12 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(
             serialized_av,
             (TargetArtifact.Status.FAILED, None, (0, 0, 0))
+        )
+        self.assertEqual(
+            DeviceArtifact.objects.get(artifact_version=profile_av).extra_info,
+            {"reasons": reasons,
+             "valid": "invalid",
+             "active": True}
         )
 
     def test_update_target_artifacts_from_status_report_cleanup(self):

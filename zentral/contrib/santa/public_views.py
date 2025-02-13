@@ -24,6 +24,25 @@ logger = logging.getLogger('zentral.contrib.santa.views.api')
 class BaseSyncView(View):
     use_enrolled_machine_cache = True
 
+    def _get_enrollment_secret_secret(self):
+        try:
+            scheme, secret = self.request.META["HTTP_ZENTRAL_AUTHORIZATION"].split()
+            scheme = scheme.strip()
+            secret = secret.strip()
+        except KeyError:
+            # Legacy URLs, TODO: remove
+            try:
+                return self.kwargs["enrollment_secret"]
+            except KeyError:
+                logger.error("No authentication credentials found")
+        except ValueError:
+            logger.error("Invalid Authorization header")
+        else:
+            if scheme != "Bearer":
+                logger.error("Wrong Authorization header scheme")
+            else:
+                return secret
+
     def _get_client_cert_dn(self):
         dn = self.request.META.get("HTTP_X_SSL_CLIENT_S_DN")
         if dn:
@@ -59,8 +78,12 @@ class BaseSyncView(View):
             return enrolled_machine
 
     def post(self, request, *args, **kwargs):
-        # URL kwargs
-        self.enrollment_secret_secret = kwargs["enrollment_secret"]
+        # secret
+        self.enrollment_secret_secret = self._get_enrollment_secret_secret()
+        if not self.enrollment_secret_secret:
+            return JsonResponse({"detail": "Unauthorized"}, status=401)
+
+        # machine ID
         try:
             self.hardware_uuid = str(UUID(kwargs["machine_id"]))
         except ValueError:
@@ -107,10 +130,16 @@ class PreflightView(BaseSyncView):
         return None
 
     def _get_serial_number(self):
-        serial_number = self.request_data.get("serial_num")
-        if not serial_number:
-            raise SuspiciousOperation("Missing or empty serial_num")
-        return serial_number
+        for key in ("serial_number", "serial_num"):
+            if key in self.request_data:
+                serial_num = self.request_data[key]
+                if serial_num:
+                    return serial_num
+        raise SuspiciousOperation("Missing or empty serial number")
+
+    def _iter_rule_count_keys(self):
+        for prefix in ("binary", "cdhash", "certificate", "compiler", "signingid", "transitive", "teamid"):
+            yield f"{prefix}_rule_count"
 
     def _get_enrolled_machine_defaults(self):
         serial_number = self._get_serial_number()
@@ -121,8 +150,7 @@ class PreflightView(BaseSyncView):
             'santa_version': self.request_data['santa_version'],
         }
         # cleanup rule counts
-        for prefix in ("binary", "certificate", "compiler", "signingid", "transitive", "teamid"):
-            key = f"{prefix}_rule_count"
+        for key in self._iter_rule_count_keys():
             val = self.request_data.get(key)
             if isinstance(val, int):
                 if val > 2147483648:
@@ -263,17 +291,32 @@ class PreflightView(BaseSyncView):
 
     def do_post(self):
         self._commit_machine_snapshot()
+        comparable_santa_version = self.enrolled_machine.get_comparable_santa_version()
 
         response_dict = self.enrolled_machine.enrollment.configuration.get_sync_server_config(
             self.enrolled_machine.serial_number,
-            self.enrolled_machine.get_comparable_santa_version()
+            comparable_santa_version,
         )
 
         # clean sync?
-        clean_sync = self.request_data.get("request_clean_sync") or self.enrollment_action is not None
+        clean_sync = (
+            self.request_data.get("request_clean_sync")
+            # enrollment
+            or self.enrollment_action is not None
+            # all rule count keys are missing
+            or all(k not in self.request_data for k in self._iter_rule_count_keys())
+        )
         if clean_sync:
             MachineRule.objects.filter(enrolled_machine=self.enrolled_machine).delete()
-            response_dict["clean_sync"] = True
+            if comparable_santa_version < (2024, 1):
+                response_dict["clean_sync"] = True
+            else:
+                response_dict["sync_type"] = "clean"
+        else:
+            if comparable_santa_version < (2024, 1):
+                response_dict["clean_sync"] = False
+            else:
+                response_dict["sync_type"] = "normal"
 
         # sync incident update?
         incident_update = None

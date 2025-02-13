@@ -1,4 +1,5 @@
 import base64
+from datetime import datetime, timedelta
 from functools import reduce
 import operator
 from unittest.mock import Mock, patch
@@ -9,9 +10,9 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils.crypto import get_random_string
 from accounts.models import User
-from realms.utils import build_password_hash_dict
 from zentral.contrib.inventory.models import MetaBusinessUnit
-from zentral.contrib.mdm.models import DEPDevice
+from zentral.contrib.mdm.models import DEPDevice, DEPEnrollment
+from zentral.utils.passwords import build_password_hash_dict
 from .utils import (force_dep_enrollment, force_dep_device, force_dep_virtual_server,
                     force_push_certificate, force_realm, force_scep_config)
 
@@ -66,11 +67,13 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
     def test_create_dep_enrollment_os_version_errors(self):
         self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
         name = get_random_string(64)
+        display_name = get_random_string(12)
         push_certificate = force_push_certificate()
         scep_config = force_scep_config()
         dep_virtual_server = force_dep_virtual_server()
         response = self.client.post(reverse("mdm:create_dep_enrollment"),
                                     {"de-name": name,
+                                     "de-display_name": display_name,
                                      "de-scep_config": scep_config.pk,
                                      "de-push_certificate": push_certificate.pk,
                                      "de-virtual_server": dep_virtual_server.pk,
@@ -129,6 +132,140 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
                              "await_device_configured",
                              "Required for the admin account setup")
 
+    def test_create_dep_enrollment_missing_realm(self):
+        self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
+        name = get_random_string(64)
+        push_certificate = force_push_certificate()
+        scep_config = force_scep_config()
+        dep_virtual_server = force_dep_virtual_server()
+        response = self.client.post(reverse("mdm:create_dep_enrollment"),
+                                    {"de-name": name,
+                                     "de-use_realm_user": "on",
+                                     "de-scep_config": scep_config.pk,
+                                     "de-push_certificate": push_certificate.pk,
+                                     "de-virtual_server": dep_virtual_server.pk,
+                                     "es-meta_business_unit": self.mbu.pk},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/depenrollment_form.html")
+        self.assertFormError(response.context["dep_enrollment_form"],
+                             "use_realm_user",
+                             "This option is only valid if a 'realm' is selected")
+
+    def test_create_dep_enrollment_missing_username_pattern(self):
+        self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
+        name = get_random_string(64)
+        push_certificate = force_push_certificate()
+        scep_config = force_scep_config()
+        dep_virtual_server = force_dep_virtual_server()
+        realm = force_realm()
+        response = self.client.post(reverse("mdm:create_dep_enrollment"),
+                                    {"de-name": name,
+                                     "de-realm": realm.pk,
+                                     "de-use_realm_user": "on",
+                                     "de-scep_config": scep_config.pk,
+                                     "de-push_certificate": push_certificate.pk,
+                                     "de-virtual_server": dep_virtual_server.pk,
+                                     "es-meta_business_unit": self.mbu.pk},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/depenrollment_form.html")
+        self.assertFormError(response.context["dep_enrollment_form"],
+                             "username_pattern",
+                             "This field is required when the 'use realm user' option is ticked")
+
+    def test_create_dep_enrollment_invalid_username_pattern_choice(self):
+        self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
+        name = get_random_string(64)
+        push_certificate = force_push_certificate()
+        scep_config = force_scep_config()
+        dep_virtual_server = force_dep_virtual_server()
+        realm = force_realm()
+        response = self.client.post(reverse("mdm:create_dep_enrollment"),
+                                    {"de-name": name,
+                                     "de-realm": realm.pk,
+                                     "de-username_pattern": "YOLO",
+                                     "de-scep_config": scep_config.pk,
+                                     "de-push_certificate": push_certificate.pk,
+                                     "de-virtual_server": dep_virtual_server.pk,
+                                     "es-meta_business_unit": self.mbu.pk},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/depenrollment_form.html")
+        self.assertFormError(response.context["dep_enrollment_form"],
+                             "username_pattern",
+                             'Select a valid choice. YOLO is not one of the available choices.')
+
+    def test_create_dep_enrollment_username_pattern_without_use_realm_user(self):
+        self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
+        name = get_random_string(64)
+        push_certificate = force_push_certificate()
+        scep_config = force_scep_config()
+        dep_virtual_server = force_dep_virtual_server()
+        realm = force_realm()
+        response = self.client.post(reverse("mdm:create_dep_enrollment"),
+                                    {"de-name": name,
+                                     "de-realm": realm.pk,
+                                     "de-username_pattern": DEPEnrollment.UsernamePattern.EMAIL_PREFIX,
+                                     "de-scep_config": scep_config.pk,
+                                     "de-push_certificate": push_certificate.pk,
+                                     "de-virtual_server": dep_virtual_server.pk,
+                                     "es-meta_business_unit": self.mbu.pk},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/depenrollment_form.html")
+        self.assertFormError(response.context["dep_enrollment_form"],
+                             "username_pattern",
+                             "This field can only be used if the 'use realm user' option is ticked")
+
+    def test_create_dep_enrollment_no_token(self):
+        self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
+        name = get_random_string(64)
+        display_name = get_random_string(12)
+        push_certificate = force_push_certificate()
+        scep_config = force_scep_config()
+        dep_virtual_server = force_dep_virtual_server()
+        dep_virtual_server.token = None
+        dep_virtual_server.save()
+        realm = force_realm()
+        response = self.client.post(reverse("mdm:create_dep_enrollment"),
+                                    {"de-name": name,
+                                     "de-display_name": display_name,
+                                     "de-realm": realm.pk,
+                                     "de-scep_config": scep_config.pk,
+                                     "de-push_certificate": push_certificate.pk,
+                                     "de-virtual_server": dep_virtual_server.pk,
+                                     "es-meta_business_unit": self.mbu.pk,
+                                     "de-is_supervised": "on"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/depenrollment_form.html")
+        self.assertFormError(response.context["form"], None, "DEP virtual server has no token")
+
+    def test_create_dep_enrollment_token_expired(self):
+        self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
+        name = get_random_string(64)
+        display_name = get_random_string(12)
+        push_certificate = force_push_certificate()
+        scep_config = force_scep_config()
+        dep_virtual_server = force_dep_virtual_server()
+        dep_virtual_server.token.access_token_expiry = datetime.utcnow() - timedelta(seconds=10)
+        dep_virtual_server.token.save()
+        realm = force_realm()
+        response = self.client.post(reverse("mdm:create_dep_enrollment"),
+                                    {"de-name": name,
+                                     "de-display_name": display_name,
+                                     "de-realm": realm.pk,
+                                     "de-scep_config": scep_config.pk,
+                                     "de-push_certificate": push_certificate.pk,
+                                     "de-virtual_server": dep_virtual_server.pk,
+                                     "es-meta_business_unit": self.mbu.pk,
+                                     "de-is_supervised": "on"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/depenrollment_form.html")
+        self.assertFormError(response.context["form"], None, "DEP virtual server token has expired")
+
     @patch("zentral.contrib.mdm.dep.DEPClient.from_dep_virtual_server")
     def test_create_dep_enrollment_post(self, from_dep_virtual_server):
         profile_uuid = uuid.uuid4()
@@ -140,11 +277,13 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         from_dep_virtual_server.return_value = client
         self._login("mdm.add_depenrollment", "mdm.view_depenrollment")
         name = get_random_string(64)
+        display_name = get_random_string(12)
         push_certificate = force_push_certificate()
         scep_config = force_scep_config()
         dep_virtual_server = force_dep_virtual_server()
         response = self.client.post(reverse("mdm:create_dep_enrollment"),
                                     {"de-name": name,
+                                     "de-display_name": display_name,
                                      "de-scep_config": scep_config.pk,
                                      "de-scep_verification": "",
                                      "de-push_certificate": push_certificate.pk,
@@ -157,17 +296,19 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
                                      "de-admin_short_name": "fomo",
                                      "de-await_device_configured": "on",
                                      "de-admin_password": "1234",
-                                     "de-Accessibility": "on",
+                                     "de-ssp-Accessibility": "on",
                                      "es-meta_business_unit": self.mbu.pk},
                                     follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "mdm/depenrollment_detail.html")
         self.assertContains(response, name)
+        self.assertContains(response, display_name)
         self.assertContains(response, push_certificate.name)
         self.assertContains(response, scep_config.name)
         self.assertContains(response, "without CSR verification")
         enrollment = response.context["object"]
         self.assertEqual(enrollment.name, name)
+        self.assertEqual(enrollment.display_name, display_name)
         self.assertEqual(enrollment.push_certificate, push_certificate)
         self.assertEqual(enrollment.scep_config, scep_config)
         self.assertEqual(enrollment.ios_max_version, "")
@@ -208,10 +349,14 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "mdm/depenrollment_detail.html")
         self.assertContains(response, enrollment.name)
+        self.assertContains(response, enrollment.display_name)
         self.assertContains(response, enrollment.push_certificate.name)
         self.assertNotContains(response, enrollment.push_certificate.get_absolute_url())
         self.assertContains(response, enrollment.scep_config.name)
         self.assertNotContains(response, enrollment.scep_config.get_absolute_url())
+        self.assertNotContains(response, "Username pattern")
+        self.assertNotContains(response, "Username prefix without")
+        self.assertNotContains(response, "Realm user is admin")
 
     def test_view_dep_enrollment_extra_perms(self):
         enrollment = force_dep_enrollment(self.mbu)
@@ -224,6 +369,20 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         self.assertContains(response, enrollment.push_certificate.get_absolute_url())
         self.assertContains(response, enrollment.scep_config.name)
         self.assertContains(response, enrollment.scep_config.get_absolute_url())
+
+    def test_view_dep_enrollment_use_realm_user(self):
+        enrollment = force_dep_enrollment(self.mbu)
+        enrollment.use_realm_user = True
+        enrollment.username_pattern = DEPEnrollment.UsernamePattern.DEVICE_USERNAME
+        enrollment.save()
+        self._login("mdm.view_depenrollment")
+        response = self.client.get(reverse("mdm:dep_enrollment", args=(enrollment.pk,)))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/depenrollment_detail.html")
+        self.assertContains(response, enrollment.name)
+        self.assertContains(response, "Username pattern")
+        self.assertContains(response, "Username prefix without")
+        self.assertContains(response, "Realm user is admin")
 
     # update DEP enrollment
 
@@ -316,8 +475,10 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         from_dep_virtual_server.return_value = client
         self._login("mdm.change_depenrollment", "mdm.view_depenrollment")
         new_name = get_random_string(12)
+        new_display_name = get_random_string(12)
         response = self.client.post(reverse("mdm:update_dep_enrollment", args=(enrollment.pk,)),
                                     {"de-name": new_name,
+                                     "de-display_name": new_display_name,
                                      "de-realm": realm.pk,
                                      "de-scep_config": enrollment.scep_config.pk,
                                      "de-scep_verification": "on",
@@ -325,7 +486,7 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
                                      "de-virtual_server": enrollment.virtual_server.pk,
                                      "de-is_mdm_removable": "on",
                                      "de-is_supervised": "",
-                                     "de-AppleID": "on",
+                                     "de-ssp-AppleID": "on",
                                      "de-language": "de",
                                      "de-include_tls_certificates": "on",
                                      "de-macos_min_version": "13.3.1",
@@ -338,12 +499,14 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "mdm/depenrollment_detail.html")
         self.assertContains(response, new_name)
+        self.assertContains(response, new_display_name)
         self.assertContains(response, realm.name)
         self.assertContains(response, enrollment.push_certificate.name)
         self.assertContains(response, enrollment.scep_config.name)
         self.assertContains(response, "with CSR verification")
         enrollment = response.context["object"]
         self.assertEqual(enrollment.name, new_name)
+        self.assertEqual(enrollment.display_name, new_display_name)
         self.assertEqual(enrollment.realm, realm)
         self.assertEqual(enrollment.macos_min_version, "13.3.1")
         self.assertEqual(enrollment.skip_setup_items, ["AppleID"])
@@ -379,6 +542,7 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         self._login("mdm.change_depenrollment", "mdm.view_depenrollment")
         response = self.client.post(reverse("mdm:update_dep_enrollment", args=(enrollment.pk,)),
                                     {"de-name": enrollment.name,
+                                     "de-display_name": enrollment.display_name,
                                      "de-realm": realm.pk,
                                      "de-scep_config": enrollment.scep_config.pk,
                                      "de-push_certificate": enrollment.push_certificate.pk,
@@ -411,6 +575,7 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         self._login("mdm.change_depenrollment", "mdm.view_depenrollment")
         response = self.client.post(reverse("mdm:update_dep_enrollment", args=(enrollment.pk,)),
                                     {"de-name": enrollment.name,
+                                     "de-display_name": enrollment.display_name,
                                      "de-realm": realm.pk,
                                      "de-scep_config": enrollment.scep_config.pk,
                                      "de-push_certificate": enrollment.push_certificate.pk,
@@ -446,6 +611,7 @@ class MDMDEPEnrollmentSetupViewsTestCase(TestCase):
         self._login("mdm.change_depenrollment", "mdm.view_depenrollment")
         response = self.client.post(reverse("mdm:update_dep_enrollment", args=(enrollment.pk,)),
                                     {"de-name": enrollment.name,
+                                     "de-display_name": enrollment.display_name,
                                      "de-realm": realm.pk,
                                      "de-scep_config": enrollment.scep_config.pk,
                                      "de-push_certificate": enrollment.push_certificate.pk,

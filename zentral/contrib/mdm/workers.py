@@ -5,6 +5,7 @@ import psycopg2.extras
 from zentral.utils.leaky_bucket import LeakyBucket
 from zentral.conf import settings
 from zentral.core.exceptions import ImproperlyConfigured
+from zentral.core.queues import queues
 from .apns import apns_client_cache
 from .events import post_mdm_device_notification_event
 
@@ -129,12 +130,19 @@ class BaseAPNSWorker:
         if self.metrics_exporter:
             self.metrics_exporter.start()
             self.metrics_exporter.add_counter(self.counter_name, ["target", "status"])
+        exit_code = 0
         while True:
             # rate limit the DB queries
             self.db_query_leaky_bucket.consume()
-            self.run_once()
-            if only_once:
+            try:
+                self.run_once()
+            except Exception:
+                logger.exception("Runtime error")
+                exit_code = 1
+            if exit_code or only_once:
                 break
+        queues.stop()
+        return exit_code
 
 
 class DevicesAPNSWorker(BaseAPNSWorker):
@@ -153,6 +161,7 @@ class DevicesAPNSWorker(BaseAPNSWorker):
         "  AND ed.checkout_at IS NULL"
         "  AND ed.token IS NOT NULL"
         "  AND ed.push_magic IS NOT NULL"
+        "  AND pc.certificate IS NOT NULL"
         "  AND pc.not_before < NOW()"
         "  AND pc.not_after > NOW()"
         # must be notified
@@ -224,6 +233,7 @@ class UsersAPNSWorker(BaseAPNSWorker):
         "  AND ed.checkout_at IS NULL"
         "  AND eu.token IS NOT NULL"
         "  AND ed.push_magic IS NOT NULL"
+        "  AND pc.certificate IS NOT NULL"
         "  AND pc.not_before < NOW()"
         "  AND pc.not_after > NOW()"
         # must be notified

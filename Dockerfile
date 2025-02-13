@@ -60,15 +60,9 @@ RUN set -eux ; \
     cd .. ; rm -rf bomutils-*
 RUN set -eux ; \
     \
-    curl -fsSL https://github.com/mackyle/xar/archive/xar-1.6.1.tar.gz | tar xvz; \
+    curl -fsSL https://github.com/zentralopensource/xar/archive/zentral.tar.gz | tar xvz; \
     cd xar-*/xar ; \
-    sed -i 's/OpenSSL_add_all_ciphers/CRYPTO_new_ex_data/' configure.ac ; \
-    curl -L -o config.guess 'http://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD' ; \
     ./autogen.sh && ./configure --with-bzip2 ; \
-    if [ "$(arch)" = "aarch64" ] ; then \
-      sed -i 's/CPPFLAGS :=/CPPFLAGS := -fsigned-char/' Makefile ; \
-      sed -i 's/CFLAGS :=/CFLAGS := -fsigned-char/' Makefile ; \
-    fi ; \
     make ; make install ; \
     cd ../.. ; rm -rf xar-*
 
@@ -91,19 +85,19 @@ RUN npm install && npm run build
 #
 
 # Installing the extra requirements for dev
-FROM base-builder as dev-builder
+FROM base-builder AS dev-builder
 COPY constraints.txt requirements_*.txt ./
 RUN pip install -r requirements_dev.txt -r requirements_aws.txt -r requirements_gcp.txt
 
 
 # Installing the extra requirements for aws
-FROM base-builder as aws-builder
+FROM base-builder AS aws-builder
 COPY constraints.txt requirements_aws.txt ./
 RUN pip install -r requirements_aws.txt
 
 
 # Installing the extra requirements for gcp
-FROM base-builder as gcp-builder
+FROM base-builder AS gcp-builder
 COPY constraints.txt requirements_gcp.txt ./
 RUN pip install -r requirements_gcp.txt
 
@@ -116,7 +110,7 @@ RUN pip install -r requirements_gcp.txt
 # - copy tini, mkbom and xar from stage 0
 #
 
-FROM python:3.10-slim-bookworm as base-runner
+FROM python:3.10-slim-bookworm AS base-runner
 
 # zentral apt dependencies
 RUN apt-get update && \
@@ -160,7 +154,7 @@ COPY --from=base-builder /usr/local/bin/xar /usr/local/bin/xar
 # - copy venv from APP_ENV builder
 #
 
-FROM base-runner as dev-runner
+FROM base-runner AS dev-runner
 COPY ./tests /zentral/tests
 RUN mkdir /prometheus_sd && chown zentral:zentral /prometheus_sd
 COPY --from=dev-builder /opt/venv /opt/venv
@@ -174,7 +168,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 
-FROM base-runner as aws-runner
+FROM base-runner AS aws-runner
 COPY --from=aws-builder /opt/venv /opt/venv
 # extra zentral apt dependencies
 RUN apt-get update && \
@@ -186,7 +180,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 
-FROM base-runner as gcp-runner
+FROM base-runner AS gcp-runner
 COPY --from=gcp-builder /opt/venv /opt/venv
 
 
@@ -196,7 +190,7 @@ COPY --from=gcp-builder /opt/venv /opt/venv
 # - set workdir, user, port, env, and entrypoint
 #
 
-FROM ${APP_ENV}-runner as final
+FROM ${APP_ENV}-runner AS final
 ARG APP_VERSION
 LABEL maintainer="Éric Falconnier <eric@zentral.com>"
 

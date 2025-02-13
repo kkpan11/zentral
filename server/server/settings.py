@@ -69,7 +69,6 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'bootstrapform',
     'rest_framework',
     'django_filters',
     'django_celery_results',
@@ -80,7 +79,6 @@ INSTALLED_APPS = [
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'accounts.api_authentication.APITokenAuthentication',
-        'rest_framework.authentication.SessionAuthentication',
     ),
     # disable the Browsable API Renderer
     'DEFAULT_RENDERER_CLASSES': (
@@ -96,14 +94,32 @@ REST_FRAMEWORK = {
 
 AUTH_USER_MODEL = 'accounts.User'
 
-AUTH_PASSWORD_VALIDATORS = django_zentral_settings.get("AUTH_PASSWORD_VALIDATORS", [])
+AUTH_PASSWORD_VALIDATORS = django_zentral_settings.get("AUTH_PASSWORD_VALIDATORS", [
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
+    },
+    {
+        "NAME": "accounts.password_validation.PasswordNotAlreadyUsedValidator",
+    },
+])
 
 AUTHENTICATION_BACKENDS = [
     'accounts.auth_backends.ZentralBackend',
     'realms.auth_backends.RealmBackend',
 ]
 
+# SESSION*
 SESSION_COOKIE_SECURE = True
+SESSION_COOKIE_SAMESITE = django_zentral_settings.get("SESSION_COOKIE_SAMESITE", "Lax")
 
 if "SESSION_COOKIE_AGE" in django_zentral_settings:
     SESSION_COOKIE_AGE = django_zentral_settings["SESSION_COOKIE_AGE"]
@@ -111,6 +127,9 @@ if "SESSION_COOKIE_AGE" in django_zentral_settings:
 if "SESSION_EXPIRE_AT_BROWSER_CLOSE" in django_zentral_settings:
     SESSION_EXPIRE_AT_BROWSER_CLOSE = django_zentral_settings["SESSION_EXPIRE_AT_BROWSER_CLOSE"]
 
+# CSRF*
+CSRF_COOKIE_SECURE = True
+CSRF_COOKIE_SAMESITE = "Strict"
 if "CSRF_TRUSTED_ORIGINS" in django_zentral_settings:
     CSRF_TRUSTED_ORIGINS = django_zentral_settings["CSRF_TRUSTED_ORIGINS"]
 
@@ -123,6 +142,7 @@ for app_name in zentral_settings.get('apps', []):
     INSTALLED_APPS.append(app_name)
 
 MIDDLEWARE = [
+    'base.middlewares.never_cache_middleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -169,8 +189,7 @@ WSGI_APPLICATION = 'server.wsgi.application'
 
 
 # Database
-# https://docs.djangoproject.com/en/2.2/ref/settings/#databases
-
+# https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
@@ -178,15 +197,28 @@ DATABASES = {
         'CONN_MAX_AGE': 3600
     }
 }
-for key, default in (('HOST', None),
-                     ('PORT', None),
-                     ('NAME', 'zentral'),
-                     ('USER', 'zentral'),
-                     ('PASSWORD', None),):
-    config_key = 'POSTGRES_{}'.format(key)
-    val = django_zentral_settings.get(config_key, default)
-    if val:
-        DATABASES['default'][key] = val
+# Populate DATABASES with the following variables from the zentral conf:
+# POSTGRES_HOST (read-write default database)
+# POSTGRES_RO_HOST (optional read-only database)
+# POSTGRES_PORT
+# POSTGRES_NAME
+# POSTGRES_USER
+# POSTGRES_PASSWORD
+for database_key, host_key in (("default", "HOST"),
+                               ("ro", "RO_HOST")):
+    host = django_zentral_settings.get(f'POSTGRES_{host_key}')
+    if database_key != "default" and not host:
+        continue
+    database = DATABASES.setdefault(database_key, DATABASES["default"].copy())
+    if host:
+        database["HOST"] = host
+    for key, default in (('PORT', None),
+                         ('NAME', 'zentral'),
+                         ('USER', 'zentral'),
+                         ('PASSWORD', None),):
+        val = django_zentral_settings.get(f'POSTGRES_{key}', default)
+        if val:
+            database[key] = val
 
 # Django >= 3.2 have uses BigAutoField
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'

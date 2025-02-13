@@ -1,0 +1,15 @@
+{% load i18n static %}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>{{ title }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="{% static 'favicon.ico' %}" rel="icon">
+    <link href="{% static 'dist/user_portal.css' %}" rel="stylesheet">
+  </head>
+  <body>
+  {% block body %}
+  {% endblock %}
+  </body>
+</html>

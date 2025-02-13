@@ -1032,13 +1032,13 @@ class ComputerNameFilter(BaseMSFilter):
     def wheres(self):
         if self.value:
             if self.value != self.none_value:
-                yield "si.id is not null and si.computer_name ~* %s"
+                yield "si.id IS NOT NULL AND UPPER(si.computer_name) LIKE UPPER(%s)"
             else:
-                yield "si.id is null or si.computer_name is null"
+                yield "si.id IS NULL or si.computer_name IS NULL"
 
     def where_args(self):
         if self.value and self.value != self.none_value:
-            yield self.value
+            yield "%{}%".format(connection.ops.prep_for_like_query(self.value))
 
     def process_fetched_record(self, record, for_filtering):
         computer_name = record.pop("computer_name", None)
@@ -1065,14 +1065,21 @@ class PrincipalUserNameFilter(BaseMSFilter):
     def wheres(self):
         if self.value:
             if self.value != self.none_value:
-                yield "pu.id is not null and (pu.principal_name ~* %s or pu.display_name ~* %s)"
+                yield (
+                    "pu.id IS NOT NULL "
+                    "AND (UPPER(pu.principal_name) LIKE UPPER(%s) OR UPPER(pu.display_name) LIKE UPPER(%s))"
+                )
             else:
-                yield "pu.id is null or pu.principal_name is null"
+                yield (
+                    "pu.id IS NULL OR "
+                    "(pu.principal_name IS NULL AND pu.display_name IS NULL)"
+                )
 
     def where_args(self):
         if self.value and self.value != self.none_value:
-            yield self.value
-            yield self.value
+            prepared_value = "%{}%".format(connection.ops.prep_for_like_query(self.value))
+            yield prepared_value
+            yield prepared_value
 
     def process_fetched_record(self, record, for_filtering):
         for attr in ("principal_name", "display_name"):
@@ -1229,15 +1236,17 @@ class IncidentSeverityFilter(BaseMSFilter):
     severities_dict = dict(Severity.choices())
 
     def joins(self):
+        open_values = tuple(Status.open_values())
         yield (
-            "left join ("
-            "select mi.serial_number as serial_number, max(i.severity) as max_incident_severity "
-            "from incidents_machineincident as mi "
-            "join incidents_incident as i on (i.id = mi.incident_id) "
-            "where i.status in ({}) "
-            "group by mi.serial_number"
-            ") as mis on (mis.serial_number = ms.serial_number)"
-        ).format(",".join("'{}'".format(s) for s in Status.open_values()))
+            ("left join ("
+             "select mi.serial_number as serial_number, max(i.severity) as max_incident_severity "
+             "from incidents_machineincident as mi "
+             "join incidents_incident as i on (i.id = mi.incident_id) "
+             "where i.status in %s and mi.status in %s "
+             "group by mi.serial_number"
+             ") as mis on (mis.serial_number = ms.serial_number)"),
+            [open_values, open_values]
+        )
 
     def wheres(self):
         if self.value:

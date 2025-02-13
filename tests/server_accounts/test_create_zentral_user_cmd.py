@@ -18,6 +18,16 @@ class CreateZentralUserTestCase(TestCase):
         )
         return out.getvalue()
 
+    def test_service_account_superuser(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.call_command("yolo", "fomo@example.com", "--service-account", "--superuser")
+        self.assertEqual(cm.exception.code, 5)
+
+    def test_service_account_send_reset(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.call_command("yolo", "fomo@example.com", "--service-account", "--send-reset")
+        self.assertEqual(cm.exception.code, 6)
+
     def test_create_user_invalid_username(self):
         with self.assertRaises(SystemExit) as cm:
             self.call_command(" ", "fomo@example.com")
@@ -47,12 +57,13 @@ class CreateZentralUserTestCase(TestCase):
 
     def test_create_user_json(self):
         result = json.loads(self.call_command("yolo", "fomo@example.com", "--json"))
+        self.assertFalse(result["service_account"])
         self.assertFalse(result["superuser"])
         self.assertEqual(result["username"], "yolo")
         self.assertEqual(result["email"], "fomo@example.com")
         self.assertTrue(result["created"])
         self.assertFalse(result["updated"])
-        self.assertIsNone(result["api_token"])
+        self.assertNotIn("api_token", result)
         self.assertFalse(result["api_token_created"])
         self.assertTrue(result["password_reset_url"].startswith("https://"))
 
@@ -107,7 +118,7 @@ class CreateZentralUserTestCase(TestCase):
     def test_create_user_existing_api_token_json(self):
         self.call_command("yolo", "fomo@example.com", "--json", "--with-api-token")
         result = json.loads(self.call_command("yolo", "fomo@example.com", "--json", "--with-api-token"))
-        self.assertIsNone(result["api_token"])
+        self.assertNotIn("api_token", result)
         self.assertFalse(result["api_token_created"])
 
     def test_create_user_send_email(self):
@@ -115,3 +126,26 @@ class CreateZentralUserTestCase(TestCase):
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].subject, "Invitation to Zentral")
         self.assertIn("Your username: yolo", mail.outbox[0].body)
+
+    def test_superuser_service_account(self):
+        result = json.loads(
+            self.call_command("yolo", "fomo@example.com", "--service-account", "--json")
+        )
+        api_token = result.pop("api_token")
+        self.assertEqual(
+            result,
+            {'api_token_created': True,
+             'created': True,
+             'email': 'fomo@example.com',
+             'service_account': True,
+             'superuser': False,
+             'updated': False,
+             'username': 'yolo'}
+        )
+        user = User.objects.get(email='fomo@example.com')
+        self.assertEqual(
+            APIToken.objects._hash_key(api_token),
+            user.api_token.hashed_key
+        )
+        self.assertFalse(user.has_usable_password())
+        self.assertTrue(user.is_service_account)

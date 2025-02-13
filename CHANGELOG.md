@@ -4,6 +4,8 @@
 
 #### MDM
 
+Support for custom DDM declarations.
+
 Support for DDM software updates, with automatic enforcement of the latest OS versions.
 
 Support for enforced software update to the latest OS versions during ADE.
@@ -50,6 +52,12 @@ Support for the Munki `default_installs` key.
 
 Support for the [Santa Signing ID rules](https://santa.dev/concepts/rules.html#signing-id-rules).
 
+Support for the [Santa CDHASH rules](https://santa.dev/concepts/rules.html#cdhash-rules).
+
+Support for the `SyncExtraHeaders` configuration key and implementation of the authentication via `Zentral-Authorization` header.
+
+Exception portal.
+
 #### Inventory
 
 Jamf extensions attribute to principal user mapping.
@@ -69,6 +77,14 @@ New `zentral.core.stores.backends.panther` store backend for [Panther](https://p
 🚧 Alpha release of the new UI.
 
 ### Backward incompatibilities
+
+#### 🧨 Santa bundle rules removed
+
+Zentral doesn't support rules with a Bundle as target anymore. A migration will translated those rules into Binary rules.
+
+#### 🧨 Santa agent authentication
+
+The Santa agent is now authenticated with an extra `Zentral-Authorization` header that must contain the enrollment secret. The older endpoints are still active, but they are deprecated and will be removed in the near future.
 
 #### 🧨 dependency on Redis
 

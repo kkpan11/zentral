@@ -1,6 +1,5 @@
 {% extends 'base.html' %}
-{% load inventory_extras %}
-{% load ui_extras %}
+{% load base_extras inventory_extras ui_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
@@ -27,9 +26,14 @@
               {% endif %}
         </div>
     </div>
+    {% with object.enrollment_secret as secret %}
     <h4>Configuration</h4>
     <table class="table-object-properties">
     <tbody>
+        <tr>
+        <th width="200px">Display name</th>
+        <td>{{ object.display_name }}</td>
+        </tr>
         <tr>
         <th width="200px">Push certificate</th>
         <td>
@@ -71,7 +75,7 @@
         </tr>
         <tr>
         <th>Business unit</th>
-        <td>{{ object.enrollment_secret.meta_business_unit }}</td>
+        <td>{{ secret.meta_business_unit }}</td>
         </tr>
         <tr>
         <th>Enrollment tag{{ secret.tags.count|pluralize }}</th>
@@ -98,6 +102,7 @@
         </tr>
     </tbody>
     </table>
+    {% endwith %}
 
     <h4>Authentication</h4>
     <table class="table-object-properties">
@@ -120,10 +125,16 @@
         <th>Use realm user</th>
         <td>{{ object.use_realm_user|yesno }}</td>
         </tr>
+        {% if object.use_realm_user %}
+        <tr>
+        <th>Username pattern</th>
+        <td>{{ object.get_username_pattern_display }}</td>
+        </tr>
         <tr>
         <th>Realm user is admin</th>
         <td>{{ object.realm_user_is_admin|yesno }}</td>
         </tr>
+        {% endif %}
         <tr>
         <th>Admin full name</th>
         <td>{{ object.admin_full_name|default:"-" }}</td>
@@ -255,7 +266,7 @@
     {% for device in object.depdevice_set.all %}
     <tr>
       <td>
-        <a name="{{ device.serial_number }}" href="{{ device.get_absolute_url }}">{{ device.serial_number }}</a>
+        <a name="{{ device.serial_number }}" href="{{ device.get_absolute_url }}">{{ device.serial_number|privacywrapper }}</a>
         {% if device.is_deleted %}
         <span class="label label-danger">DELETED</span>
         {% endif %}
@@ -291,9 +302,9 @@
         {% with s.get_serial_number as sn %}
         {% if sn %}
         {% if perms.mdm.view_enrolleddevice and s.enrolled_device %}
-        <a href="{% url 'mdm:enrolled_device' s.enrolled_device.pk %}">{{ sn }}</a>
+        <a href="{% url 'mdm:enrolled_device' s.enrolled_device.pk %}">{{ sn|privacywrapper }}</a>
         {% else %}
-        {{ sn }}
+        {{ sn|privacywrapper }}
         {% endif %}
         {% else %}
         -

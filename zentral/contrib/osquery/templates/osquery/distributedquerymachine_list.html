@@ -1,5 +1,5 @@
 {% extends 'base.html' %}
-{% load inventory_extras ui_extras %}
+{% load base_extras inventory_extras ui_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
@@ -27,7 +27,7 @@
 <h2 class="mye-3">Run #{{ distributed_query }}</h2>
 
 <div class="d-flex flex-wrap align-items-center mb-1">
-    <form method="GET" class="search-form d-flex flex-row flex-wrap w-75">
+    <form method="GET" class="search-form">
         
         {{ form }}
         
@@ -55,7 +55,7 @@
   <tbody>
   {% for dqm in page_obj %}
   <tr>
-    <td><a href="{% machine_url dqm.serial_number %}">{{ dqm.serial_number }}</a></td>
+    <td><a href="{% machine_url dqm.serial_number %}">{{ dqm.serial_number|privacywrapper }}</a></td>
     <td>{% if dqm.status > 0 %}Error{% else %}{% if dqm.status == 0 %}OK{% else %}In flight{% endif %}{% endif %}</td>
     <td>{{ dqm.error_message|default:"-" }}</td>
     <td>{{ dqm.memory|default_if_none:"-" }}</td>

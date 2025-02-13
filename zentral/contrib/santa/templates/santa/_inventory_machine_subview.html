@@ -1,3 +1,4 @@
+{% load base_extras %}
 {% if enrolled_machine %}
 <h3>Santa</h3>
 {% if err_message %}
@@ -12,7 +13,7 @@
   <dd class="col-sm-9">{{ enrolled_machine.primary_user|default:"-" }}</dd>
   {% if enrolled_machine.hardware_uuid %}
   <dt class="col-sm-3 text-md-end">UUID</dt>
-  <dd class="col-sm-9">{{ enrolled_machine.hardware_uuid }}</dd>
+  <dd class="col-sm-9">{{ enrolled_machine.hardware_uuid|privacywrapper }}</dd>
   {% endif %}
   <dt class="col-sm-3 text-md-end">Client mode</dt>
   <dd class="col-sm-9">{{ enrolled_machine.get_client_mode_display }}</dd>
@@ -20,6 +21,8 @@
   <dd class="col-sm-9">{{ enrolled_machine.santa_version }}</dd>
   <dt class="col-sm-3 text-md-end">Binary rule{% if binary_rule_count != "-" %}{{ binary_rule_count|pluralize }}{% else %}s{% endif %}</dt>
   <dd class="col-sm-9">{{ binary_rule_count }}</dd>
+  <dt class="col-sm-3 text-md-end">cdhash rule{% if cdhash_rule_count != "-" %}{{ cdhash_rule_count|pluralize }}{% else %}s{% endif %}</dt>
+  <dd class="col-sm-9">{{ cdhash_rule_count }}</dd>
   <dt class="col-sm-3 text-md-end">Certicate rule{% if certificate_rule_count != "-" %}{{ certificate_rule_count|pluralize }}{% else %}s{% endif %}</dt>
   <dd class="col-sm-9">{{ certificate_rule_count }}</dd>
   <dt class="col-sm-3 text-md-end">Compiler rule{% if compiler_rule_count != "-" %}{{ compiler_rule_count|pluralize }}{% else %}s{% endif %}</dt>
