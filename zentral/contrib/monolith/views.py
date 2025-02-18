@@ -1,5 +1,6 @@
 import logging
 from urllib.parse import urlencode
+from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
@@ -20,6 +21,7 @@ from zentral.utils.terraform import build_config_response
 from zentral.utils.text import get_version_sort_key, shard as compute_shard, encode_args
 from zentral.utils.views import CreateViewWithAudit, DeleteViewWithAudit, UpdateViewWithAudit, UserPaginationListView
 from .conf import monolith_conf
+from .events import post_monolith_sync_catalogs_request
 from .forms import (AddManifestCatalogForm, EditManifestCatalogForm, DeleteManifestCatalogForm,
                     AddManifestEnrollmentPackageForm,
                     AddManifestSubManifestForm, EditManifestSubManifestForm, DeleteManifestSubManifestForm,
@@ -36,7 +38,8 @@ from .models import (Catalog, CacheServer,
                      Condition,
                      Repository,
                      SUB_MANIFEST_PKG_INFO_KEY_CHOICES, SubManifest, SubManifestPkgInfo)
-from .repository_backends import RepositoryBackend
+from .repository_backends import load_repository_backend, RepositoryBackend
+from .repository_backends.azure import AzureRepositoryForm
 from .repository_backends.s3 import S3RepositoryForm
 from .terraform import iter_resources
 from .utils import test_monolith_object_inclusion, test_pkginfo_catalog_inclusion
@@ -111,6 +114,10 @@ class CreateRepositoryView(PermissionRequiredMixin, TemplateView):
         if not form:
             form = RepositoryForm(prefix="r")
         context["form"] = form
+        azure_form = kwargs.get("azure_form")
+        if not azure_form:
+            azure_form = AzureRepositoryForm(prefix="azure")
+        context["azure_form"] = azure_form
         s3_form = kwargs.get("s3_form")
         if not s3_form:
             s3_form = S3RepositoryForm(prefix="s3")
@@ -119,11 +126,14 @@ class CreateRepositoryView(PermissionRequiredMixin, TemplateView):
 
     def post(self, request, *args, **kwargs):
         form = RepositoryForm(request.POST, prefix="r")
+        azure_form = AzureRepositoryForm(request.POST, prefix="azure")
         s3_form = S3RepositoryForm(request.POST, prefix="s3")
         if form.is_valid():
             backend = RepositoryBackend(form.cleaned_data["backend"])
             backend_form = None
-            if backend == RepositoryBackend.S3:
+            if backend == RepositoryBackend.AZURE:
+                backend_form = azure_form
+            elif backend == RepositoryBackend.S3:
                 backend_form = s3_form
             if backend_form is None or backend_form.is_valid():
                 repository = form.save(commit=False)
@@ -141,7 +151,7 @@ class CreateRepositoryView(PermissionRequiredMixin, TemplateView):
                 transaction.on_commit(post_event_and_notify)
                 return redirect(repository)
         return self.render_to_response(
-            self.get_context_data(form=form, s3_form=s3_form)
+            self.get_context_data(form=form, azure_form=azure_form, s3_form=s3_form)
         )
 
 
@@ -160,7 +170,7 @@ class UpdateRepositoryView(PermissionRequiredMixin, TemplateView):
     permission_required = "monolith.change_repository"
 
     def dispatch(self, request, *args, **kwargs):
-        self.repository = get_object_or_404(Repository, pk=kwargs["pk"])
+        self.repository = get_object_or_404(Repository.objects.for_update(), pk=kwargs["pk"])
         self.backend = RepositoryBackend(self.repository.backend)
         return super().dispatch(request, *args, **kwargs)
 
@@ -171,6 +181,17 @@ class UpdateRepositoryView(PermissionRequiredMixin, TemplateView):
         if not form:
             form = RepositoryForm(prefix="r", instance=self.repository)
         context["form"] = form
+        azure_form = kwargs.get("azure_form")
+        if not azure_form:
+            azure_form = AzureRepositoryForm(
+                prefix="azure",
+                initial=(
+                    self.repository.get_backend_kwargs()
+                    if self.backend == RepositoryBackend.AZURE
+                    else None
+                )
+            )
+        context["azure_form"] = azure_form
         s3_form = kwargs.get("s3_form")
         if not s3_form:
             s3_form = S3RepositoryForm(
@@ -191,6 +212,15 @@ class UpdateRepositoryView(PermissionRequiredMixin, TemplateView):
             prefix="r",
             instance=self.repository
         )
+        azure_form = AzureRepositoryForm(
+            request.POST,
+            prefix="azure",
+            initial=(
+                self.repository.get_backend_kwargs()
+                if self.backend == RepositoryBackend.AZURE
+                else None
+            )
+        )
         s3_form = S3RepositoryForm(
             request.POST,
             prefix="s3",
@@ -203,7 +233,9 @@ class UpdateRepositoryView(PermissionRequiredMixin, TemplateView):
         if form.is_valid():
             backend = RepositoryBackend(form.cleaned_data["backend"])
             backend_form = None
-            if backend == RepositoryBackend.S3:
+            if backend == RepositoryBackend.AZURE:
+                backend_form = azure_form
+            elif backend == RepositoryBackend.S3:
                 backend_form = s3_form
             if backend_form is None or backend_form.is_valid():
                 repository = form.save(commit=False)
@@ -224,7 +256,7 @@ class UpdateRepositoryView(PermissionRequiredMixin, TemplateView):
                 transaction.on_commit(post_event_and_notify)
                 return redirect(repository)
         return self.render_to_response(
-            self.get_context_data(form=form, s3_form=s3_form)
+            self.get_context_data(form=form, azure_form=azure_form, s3_form=s3_form)
         )
 
 
@@ -251,6 +283,29 @@ class DeleteRepositoryView(PermissionRequiredMixin, DeleteView):
 
         transaction.on_commit(post_event_and_notify)
         return super().form_valid(form)
+
+
+class SyncRepositoryView(PermissionRequiredMixin, View):
+    permission_required = "monolith.sync_repository"
+    success_url = reverse_lazy("monolith:repositories")
+
+    def post(self, request, *args, **kwargs):
+        db_repository = get_object_or_404(Repository, pk=kwargs["pk"])
+        post_monolith_sync_catalogs_request(request, db_repository)
+        repository = load_repository_backend(db_repository)
+        try:
+            repository.sync_catalogs(request)
+        except Exception as e:
+            logger.exception("Could not sync repository %s", db_repository.pk)
+            messages.error(request, f"Could not sync repository: {e}")
+        else:
+            messages.info(request, "Repository synced")
+
+            def notify():
+                notifier.send_notification("monolith.repository", str(db_repository.pk))
+
+            transaction.on_commit(notify)
+        return redirect(db_repository)
 
 
 # pkg infos

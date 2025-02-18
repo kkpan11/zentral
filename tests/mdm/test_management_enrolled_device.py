@@ -11,8 +11,8 @@ from accounts.models import User
 from zentral.contrib.inventory.models import MetaBusinessUnit
 from zentral.contrib.mdm.commands import CustomCommand
 from zentral.contrib.mdm.commands.base import load_command
-from zentral.contrib.mdm.models import Blueprint, Platform
-from .utils import (force_blueprint,
+from zentral.contrib.mdm.models import Blueprint, DeviceArtifact, Platform, TargetArtifact
+from .utils import (force_artifact, force_blueprint,
                     force_dep_enrollment_session, force_ota_enrollment_session, force_user_enrollment_session)
 
 
@@ -167,6 +167,7 @@ class EnrolledDeviceManagementViewsTestCase(TestCase):
         self.assertContains(response, "Enrollment session (1)")
         self.assertContains(response, session.get_enrollment().name)
         self.assertContains(response, session.realm_user.username)
+        self.assertNotContains(response, session.realm_user.get_absolute_url())
         self.assertNotContains(response, reverse("mdm:user_enrollment", args=(session.get_enrollment().pk,)))
         self.assertEqual(response.context["commands_count"], 0)
         self.assertNotContains(response, "See all commands")
@@ -182,6 +183,14 @@ class EnrolledDeviceManagementViewsTestCase(TestCase):
         self.assertContains(response, "Enrollment session (1)")
         self.assertContains(response, session.get_enrollment().name)
         self.assertContains(response, reverse("mdm:ota_enrollment", args=(session.get_enrollment().pk,)))
+
+    def test_enrolled_device_realm_user_link(self):
+        session, device_udid, serial_number = force_user_enrollment_session(self.mbu, completed=True)
+        self._login("mdm.view_enrolleddevice", "realms.view_realmuser")
+        response = self.client.get(reverse("mdm:enrolled_device", args=(session.enrolled_device.pk,)))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/enrolleddevice_detail.html")
+        self.assertContains(response, session.realm_user.get_absolute_url())
 
     def test_enrolled_device_no_block_link(self):
         session, device_udid, serial_number = force_ota_enrollment_session(self.mbu, completed=True)
@@ -308,6 +317,47 @@ class EnrolledDeviceManagementViewsTestCase(TestCase):
         self.assertTemplateUsed(response, "mdm/enrolleddevice_detail.html")
         self.assertContains(response, "Intel")
         self.assertNotContains(response, "Apple silicon")
+
+    # test enrolled device target artifacts
+
+    def test_enrolled_device_target_artifact_installed(self):
+        session, _, _ = force_user_enrollment_session(self.mbu, completed=True)
+        artifact, (profile_av,) = force_artifact()
+        da = DeviceArtifact.objects.create(
+            enrolled_device=session.enrolled_device,
+            artifact_version=profile_av,
+            status=TargetArtifact.Status.INSTALLED,
+            extra_info={"valid": "valid", "active": True}
+        )
+        self._login("mdm.view_enrolleddevice")
+        response = self.client.get(reverse("mdm:enrolled_device", args=(session.enrolled_device.pk,)))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/enrolleddevice_detail.html")
+        self.assertContains(response, artifact.name)
+        self.assertNotContains(response, f"mi-{da.pk}")
+
+    def test_enrolled_device_target_artifact_failed(self):
+        session, _, _ = force_user_enrollment_session(self.mbu, completed=True)
+        artifact, (profile_av,) = force_artifact()
+        error = get_random_string(12)
+        da = DeviceArtifact.objects.create(
+            enrolled_device=session.enrolled_device,
+            artifact_version=profile_av,
+            status=TargetArtifact.Status.FAILED,
+            extra_info={"valid": "invalid", "active": True,
+                        "reasons": [{"details": {"Error": error},
+                                     "description": "Configuration cannot be applied",
+                                     "code": "Error.ConfigurationCannotBeApplied"}]}
+        )
+        self._login("mdm.view_enrolleddevice")
+        response = self.client.get(reverse("mdm:enrolled_device", args=(session.enrolled_device.pk,)))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/enrolleddevice_detail.html")
+        self.assertContains(response, artifact.name)
+        self.assertContains(response, f"mi-{da.pk}")
+        self.assertContains(response, error)
+        self.assertContains(response, "Configuration cannot be applied")
+        self.assertContains(response, "Error.ConfigurationCannotBeApplied")
 
     # test enrolled device commands
 

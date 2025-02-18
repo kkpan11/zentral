@@ -4,7 +4,7 @@
 {% block content %}
 <ol class="breadcrumb">
   <li class="breadcrumb-item"><a href="/">Home</a></li>
-  <li class="breadcrumb-item"><a href="{% url 'realms:list' %}">Realms</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'realms:index' %}">SSO</a></li>
   {% for url, anchor_text in breadcrumbs %}
   {% if url %}
   <li class="breadcrumb-item"><a href="{{ url }}">{{ anchor_text }}</a></li>
@@ -16,10 +16,16 @@
 
 <div class="d-flex justify-content-between mb-3">
     <h2 class="m-0">Group{{ paginator.count|pluralize }} ({{ paginator.count }})</h2>
+    <div class="ms-auto">
+    {% if perms.realms.add_realmgroup %}
+      {% url 'realms:create_group' as url %}
+      {% button 'CREATE' url "Create new realm group" %}
+    {% endif %}
+    </div>
 </div>
 
 <div class="d-flex flex-wrap align-items-center mb-1">
-  <form method="GET" class="search-form d-flex flex-row flex-wrap w-75">
+  <form method="GET" class="search-form">
     {{ form }}
     <button type="submit" class="btn btn-link mb-2">
       <i class="bi bi-search"></i>
@@ -35,10 +41,11 @@
   <thead>
     <th>Realm</th>
     <th>Name</th>
+    <th></th>
   </thead>
   <tbody>
     {% for obj in object_list %}
-    <tr>
+    <tr class="data-row">
       <td>
         {% if perms.realms.view_realm %}
         <a href="{{ obj.realm.get_absolute_url }}">{{ obj.realm }}</a>
@@ -46,7 +53,17 @@
         {{ obj.realm }}
         {% endif %}
       </td>
-      <td><a href="{{ obj.get_absolute_url }}">{{ obj }}</a></td>
+      <td><a href="{{ obj.get_absolute_url }}">{{ obj.display_name }}</a></td>
+      <td class="text-end py-0">
+        {% if perms.realms.change_realmgroup and obj.can_be_updated %}
+          {% url 'realms:update_group' obj.pk as url %}
+          {% button 'UPDATE' url "Edit group" %}
+        {% endif %}
+        {% if perms.realms.delete_realmgroupmapping and obj.can_be_deleted %}
+          {% url 'realms:delete_group' obj.pk as url %}
+          {% button 'DELETE' url "Delete group" %}
+        {% endif %}
+      </td>
     </tr>
     {% endfor %}
   </tbody>

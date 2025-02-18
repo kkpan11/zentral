@@ -17,6 +17,7 @@ from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.text import slugify
 from zentral.contrib.inventory.models import BaseEnrollment, MetaBusinessUnit, Tag
+from zentral.utils.storage import select_dist_storage
 from zentral.utils.text import get_version_sort_key
 from .conf import monolith_conf
 from .repository_backends import RepositoryBackend, get_repository_backend, load_repository_backend
@@ -74,8 +75,13 @@ def parse_munki_name(name):
 
 
 class RepositoryManager(models.Manager):
+    def for_update(self):
+        return self.filter(
+            provisioning_uid__isnull=True
+        )
+
     def for_deletion(self):
-        return self.annotate(
+        return self.for_update().annotate(
             # not linked to a manifest
             manifest_link_count=Count("catalog__manifestcatalog"),
         ).filter(manifest_link_count=0)
@@ -85,6 +91,7 @@ class RepositoryManager(models.Manager):
 
 
 class Repository(models.Model):
+    provisioning_uid = models.CharField(max_length=256, unique=True, null=True, editable=False)
     name = models.CharField(max_length=256, unique=True)
     meta_business_unit = models.ForeignKey(MetaBusinessUnit, on_delete=models.SET_NULL, blank=True, null=True)
     backend = models.CharField(max_length=32, choices=RepositoryBackend.choices)
@@ -108,6 +115,9 @@ class Repository(models.Model):
 
     def can_be_deleted(self):
         return Repository.objects.for_deletion().filter(pk=self.pk).exists()
+
+    def can_be_updated(self):
+        return Repository.objects.for_update().filter(pk=self.pk).exists()
 
     def manifests(self):
         return Manifest.objects.distinct().filter(manifestcatalog__catalog__repository=self)
@@ -235,7 +245,7 @@ class PkgInfoCategoryManager(models.Manager):
 
 class PkgInfoCategory(models.Model):
     repository = models.ForeignKey(Repository, on_delete=models.CASCADE)
-    name = models.CharField(max_length=256, unique=True)
+    name = models.CharField(max_length=256)
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = PkgInfoCategoryManager()
@@ -415,7 +425,7 @@ class PkgInfoManager(models.Manager):
                 if isinstance(tag_shards, dict):
                     pi_opts["shards"]["tags"] = [
                         (seen_tags[tag_name], shard)
-                        for tag_name, shard in sorted(tag_shards.items(), key=lambda t:t[0].lower())
+                        for tag_name, shard in sorted(tag_shards.items(), key=lambda t: t[0].lower())
                         if tag_name in seen_tags
                     ]
         return name_c, info_c, pkg_name_list
@@ -437,7 +447,7 @@ class PkgInfo(models.Model):
     update_for = models.ManyToManyField(PkgInfoName, related_name="updated_by", blank=True)
     data = models.JSONField()
     local = models.BooleanField(default=False)
-    file = models.FileField(upload_to=pkg_info_path, blank=True)
+    file = models.FileField(upload_to=pkg_info_path, storage=select_dist_storage, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     archived_at = models.DateTimeField(blank=True, null=True)
@@ -446,10 +456,7 @@ class PkgInfo(models.Model):
 
     class Meta:
         ordering = ('name', 'version')
-        unique_together = (('name', 'version'),)
-
-    def get_key(self):
-        return (self.name.name, self.version)
+        unique_together = (('repository', 'name', 'version'),)
 
     def __str__(self):
         return "{} {}".format(self.name, self.version)
@@ -923,7 +930,9 @@ class Manifest(models.Model):
             "JOIN monolith_manifestcatalog mc ON (pc.catalog_id=mc.catalog_id) "
             "LEFT JOIN monolith_manifestcatalog_tags m2mt ON (mc.id=m2mt.manifestcatalog_id) "
             "WHERE mc.manifest_id = %(manifest_pk)s "
-            f"AND (m2mt.tag_id IS NULL {m2mt_filter});"
+            f"AND (m2mt.tag_id IS NULL {m2mt_filter})"
+            "GROUP BY pk, repository_pk, version, file_name,"
+            "installer_item_location, uninstaller_item_location, icon_name, name;"
         )
         cursor = connection.cursor()
         cursor.execute(query, kwargs)
@@ -994,8 +1003,10 @@ class Manifest(models.Model):
             "JOIN monolith_pkginfo_catalogs pc ON (pk=pc.pkginfo_id) "
             "JOIN monolith_manifestcatalog mc ON (pc.catalog_id=mc.catalog_id) "
             "LEFT JOIN monolith_manifestcatalog_tags m2mt ON (mc.id=m2mt.manifestcatalog_id) "
-            "WHERE mc.manifest_id = &(manifest_pk)s "
-            f"AND (m2mt.tag_id IS NULL {m2mt_filter});"
+            "WHERE mc.manifest_id = %(manifest_pk)s "
+            f"AND (m2mt.tag_id IS NULL {m2mt_filter}) "
+            "GROUP BY pk, repository_pk, version, file_name,"
+            "installer_item_location, uninstaller_item_location, icon_name, name;"
         )
         cursor = connection.cursor()
         cursor.execute(query, kwargs)
@@ -1132,7 +1143,7 @@ class ManifestEnrollmentPackage(models.Model):
     builder = models.CharField(max_length=256)
     enrollment_pk = models.PositiveIntegerField(null=True)
 
-    file = models.FileField(upload_to=enrollment_package_path, blank=True)
+    file = models.FileField(upload_to=enrollment_package_path, storage=select_dist_storage, blank=True)
     pkg_info = models.JSONField(blank=True, null=True)
     version = models.PositiveSmallIntegerField(default=0)
 
@@ -1140,10 +1151,11 @@ class ManifestEnrollmentPackage(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def delete(self, *args, **kwargs):
+        delete_enrollment = kwargs.pop("delete_enrollment", True)
         self.file.delete(save=False)
         enrollment = self.get_enrollment()
         super().delete(*args, **kwargs)
-        if enrollment:
+        if delete_enrollment and enrollment:
             enrollment.delete()
 
     def get_installer_item_filename(self):

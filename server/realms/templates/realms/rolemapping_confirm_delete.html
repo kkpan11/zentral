@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+
+{% block content %}
+{% with object.realm as realm %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'realms:index' %}">SSO</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'realms:role_mappings' %}">Role mappings</a></li>
+  <li class="breadcrumb-item"><a href="{{ object.get_absolute_url }}">{{ object }}</a></li>
+  <li class="breadcrumb-item active">Delete</li>
+</ol>
+
+<h2>Delete role mapping</h2>
+
+<form method="post" class="form" >{% csrf_token %}
+  <p>Do you really want to delete this role mapping?</p>
+  <p>
+    <a class="btn btn-outline-secondary" href="{{ object.get_absolute_url }}">
+      Cancel
+    </a>
+    <button class="btn btn-danger" type="submit">Delete</button>
+  </p>
+</form>
+{% endwith %}
+{% endblock %}

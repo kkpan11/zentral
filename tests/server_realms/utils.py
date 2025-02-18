@@ -2,18 +2,41 @@ import uuid
 from django.contrib.auth.models import Group
 from django.utils.crypto import get_random_string
 from accounts.models import User
-from realms.models import (Realm, RealmEmail, RealmGroup, RealmGroupMapping, RealmTagMapping,
-                           RealmUser, RealmUserGroupMembership)
-from zentral.contrib.inventory.models import Tag
+from realms.models import (Realm, RealmAuthenticationSession,
+                           RealmEmail, RealmGroup, RealmGroupMapping,
+                           RealmUser, RealmUserGroupMembership, RoleMapping)
 
 
-def force_realm(enabled_for_login=False):
+def force_realm(backend="ldap", enabled_for_login=False, user_portal=False):
+    if backend == "ldap":
+        config = {
+            "host": "ldap.example.com",
+            "bind_dn": "uid=zentral,ou=Users,o=yolo,dc=example,dc=com",
+            "bind_password": "yolo",
+            "users_base_dn": 'ou=Users,o=yolo,dc=example,dc=com',
+        }
+    elif backend == "openidc":
+        config = {
+            "client_id": "yolo",
+            "client_secret": "fomo",
+            "discovery_url": "https://zentral.example.com/.well-known/openid-configuration",
+            "extra_scopes": ["profile"],
+        }
+    elif backend == "saml":
+        config = {
+            'default_relay_state': "29eb0205-3572-4901-b773-fc82bef847ef",
+            'idp_metadata': "<md></md>"
+        }
+    else:
+        raise ValueError("Unknown backend")
     return Realm.objects.create(
         name=get_random_string(12),
-        backend="ldap",
+        backend=backend,
+        config=config,
         username_claim="username",
         email_claim="email",
         enabled_for_login=enabled_for_login,
+        user_portal=user_portal,
     )
 
 
@@ -58,33 +81,30 @@ def force_realm_group(realm=None, parent=None, display_name=None):
     )
 
 
-def force_realm_group_mapping(realm=None, group=None):
+def force_realm_group_mapping(realm=None, realm_group=None):
     if not realm:
         realm = force_realm()
-    if not group:
-        group = Group.objects.create(name=get_random_string(12))
-    realm_group_mapping = RealmGroupMapping.objects.create(
-        realm=realm,
+    if not realm_group:
+        realm_group = force_realm_group(realm=realm)
+    return RealmGroupMapping.objects.create(
         claim=get_random_string(12),
         value=get_random_string(12),
-        group=group
+        realm_group=realm_group,
     )
-    return realm, realm_group_mapping
 
 
-def force_realm_tag_mapping(realm=None, group_name=None, tag=None):
-    if not realm:
-        realm = force_realm()
-    if not group_name:
-        group_name = get_random_string(12)
-    if not tag:
-        tag = Tag.objects.create(name=get_random_string(12))
-    realm_tag_mapping = RealmTagMapping.objects.create(
-        realm=realm,
-        group_name=group_name,
-        tag=tag
+def force_group():
+    return Group.objects.create(name=get_random_string(12))
+
+
+def force_role_mapping(realm=None, group=None):
+    if not group:
+        group = force_group()
+    realm_group = force_realm_group(realm=realm)
+    return RoleMapping.objects.create(
+        realm_group=realm_group,
+        group=group,
     )
-    return realm, realm_tag_mapping
 
 
 def force_user(username=None, email=None, active=True, remote=False, service_account=False):
@@ -104,3 +124,13 @@ def force_user(username=None, email=None, active=True, remote=False, service_acc
     user.set_password(get_random_string(12))
     user.save()
     return user
+
+
+def force_realm_authentication_session(callback="realms.utils.test_callback"):
+    realm = force_realm(enabled_for_login=True)
+    _, realm_user = force_realm_user(realm=realm)
+    return RealmAuthenticationSession.objects.create(
+        realm=realm,
+        user=realm_user,
+        callback=callback,
+    )

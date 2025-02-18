@@ -9,6 +9,7 @@ from django.db.models import Count, Max
 from django.http import FileResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse, reverse_lazy
+from django.utils.functional import cached_property
 from django.views.generic import CreateView, DeleteView, DetailView, FormView, ListView, TemplateView, UpdateView, View
 from zentral.contrib.inventory.forms import EnrollmentSecretForm
 from zentral.contrib.mdm.apns import send_enrolled_device_notification, send_enrolled_user_notification
@@ -17,6 +18,7 @@ from zentral.contrib.mdm.commands.base import load_command, registered_manual_co
 from zentral.contrib.mdm.dep import add_dep_profile, assign_dep_device_profile, refresh_dep_device
 from zentral.contrib.mdm.dep_client import DEPClient, DEPClientError
 from zentral.contrib.mdm.forms import (ArtifactSearchForm, ArtifactVersionForm,
+                                       CreateDeclarationForm,
                                        AssignDEPDeviceEnrollmentForm, BlueprintArtifactForm,
                                        CreateDEPEnrollmentForm, UpdateDEPEnrollmentForm,
                                        CreateAssetArtifactForm,
@@ -28,16 +30,20 @@ from zentral.contrib.mdm.forms import (ArtifactSearchForm, ArtifactVersionForm,
                                        SoftwareUpdateEnforcementForm,
                                        UpdateArtifactForm,
                                        UserEnrollmentForm,
-                                       UpgradeEnterpriseAppForm, UpgradeProfileForm, UpgradeStoreAppForm,
-                                       UploadEnterpriseAppForm, UploadProfileForm)
+                                       UpgradeDataAssetForm, UpgradeEnterpriseAppForm,
+                                       UpgradeDeclarationForm, UpgradeProfileForm, UpgradeStoreAppForm,
+                                       UploadDataAssetForm, UploadEnterpriseAppForm, UploadProfileForm)
+from zentral.contrib.mdm.inventory import update_realm_tags
 from zentral.contrib.mdm.models import (Artifact, ArtifactVersion,
                                         Asset, Blueprint, BlueprintArtifact,
                                         Channel,
+                                        DataAsset, Declaration,
                                         DEPDevice, DEPEnrollment,
                                         DeviceCommand, UserCommand,
                                         EnrolledDevice, EnrolledUser, EnterpriseApp,
                                         FileVaultConfig,
                                         OTAEnrollment,
+                                        RealmGroupTagMapping,
                                         RecoveryPasswordConfig,
                                         SCEPConfig,
                                         SoftwareUpdateEnforcement,
@@ -46,11 +52,12 @@ from zentral.contrib.mdm.models import (Artifact, ArtifactVersion,
 from zentral.contrib.mdm.payloads import (build_configuration_profile_response,
                                           build_profile_service_configuration_profile)
 from zentral.contrib.mdm.scep import SCEPChallengeType
-from zentral.contrib.mdm.scep.microsoft_ca import MicrosoftCAChallengeForm
+from zentral.contrib.mdm.scep.microsoft_ca import MicrosoftCAChallengeForm, OktaCAChallengeForm
 from zentral.contrib.mdm.scep.static import StaticChallengeForm
 from zentral.contrib.mdm.skip_keys import skippable_setup_panes
 from zentral.contrib.mdm.software_updates import best_available_software_updates
 from zentral.utils.views import CreateViewWithAudit, DeleteViewWithAudit, UpdateViewWithAudit, UserPaginationListView
+from zentral.utils.storage import file_storage_has_signed_urls, select_dist_storage
 
 
 logger = logging.getLogger('zentral.contrib.mdm.views.management')
@@ -504,6 +511,66 @@ class UpdateUserEnrollmentView(PermissionRequiredMixin, TemplateView):
             )
 
 
+# Realm Group Tag Mappings
+
+
+class RealmGroupTagMappingListView(PermissionRequiredMixin, UserPaginationListView):
+    permission_required = "mdm.view_realmgrouptagmapping"
+
+    def get_queryset(self):
+        return (
+            RealmGroupTagMapping.objects.select_related("realm_group__realm", "tag__taxonomy")
+                                        .order_by("realm_group__realm__name", "realm_group__display_name")
+        )
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        page = ctx["page_obj"]
+        if page.number > 1:
+            qd = self.request.GET.copy()
+            qd.pop('page', None)
+            ctx['reset_link'] = "?{}".format(qd.urlencode())
+        return ctx
+
+
+class CreateRealmGroupTagMappingView(PermissionRequiredMixin, CreateView):
+    permission_required = "mdm.add_realmgrouptagmapping"
+    model = RealmGroupTagMapping
+    fields = "__all__"
+
+    def form_valid(self, form):
+        response = super().form_valid(form)
+        update_realm_tags(self.object.realm_group.realm)
+        return response
+
+
+class UpdateRealmGroupTagMappingView(PermissionRequiredMixin, UpdateView):
+    permission_required = "mdm.change_realmgrouptagmapping"
+    model = RealmGroupTagMapping
+    fields = "__all__"
+
+    def form_valid(self, form):
+        old_realm = self.get_object().realm_group.realm  # self.object is already updated
+        response = super().form_valid(form)
+        update_realm_tags(old_realm)
+        new_realm = self.object.realm_group.realm
+        if new_realm != old_realm:
+            update_realm_tags(new_realm)
+        return response
+
+
+class DeleteRealmGroupTagMappingView(PermissionRequiredMixin, DeleteView):
+    permission_required = "mdm.delete_realmgrouptagmapping"
+    model = RealmGroupTagMapping
+    success_url = reverse_lazy("mdm:realm_group_tag_mappings")
+
+    def form_valid(self, form):
+        realm = self.object.realm_group.realm
+        response = super().form_valid(form)
+        update_realm_tags(realm)
+        return response
+
+
 # Artifacts
 
 
@@ -533,7 +600,7 @@ class ArtifactListView(PermissionRequiredMixin, UserPaginationListView):
         return ctx
 
 
-class BaseUploadArtifactView(PermissionRequiredMixin, FormView):
+class BaseCreateArtifactView(PermissionRequiredMixin, FormView):
     permission_required = "mdm.add_artifact"
 
     def form_valid(self, form):
@@ -542,12 +609,33 @@ class BaseUploadArtifactView(PermissionRequiredMixin, FormView):
         return redirect(self.artifact)
 
 
-class UploadEnterpriseAppView(BaseUploadArtifactView):
+class CreateDeclarationView(BaseCreateArtifactView):
+    form_class = CreateDeclarationForm
+    template_name = "mdm/declaration_form.html"
+    artifact_type = None
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs["artifact_type"] = self.artifact_type
+        return kwargs
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx["artifact_type"] = self.artifact_type
+        return ctx
+
+
+class UploadDataAssetView(BaseCreateArtifactView):
+    form_class = UploadDataAssetForm
+    template_name = "mdm/dataasset_form.html"
+
+
+class UploadEnterpriseAppView(BaseCreateArtifactView):
     form_class = UploadEnterpriseAppForm
     template_name = "mdm/enterpriseapp_form.html"
 
 
-class UploadProfileView(BaseUploadArtifactView):
+class UploadProfileView(BaseCreateArtifactView):
     form_class = UploadProfileForm
     template_name = "mdm/profile_form.html"
 
@@ -560,13 +648,20 @@ class ArtifactView(PermissionRequiredMixin, DetailView):
         ctx = super().get_context_data(**kwargs)
         model_class = upgrade_view = None
         select_related_extra = ()
-        if self.object.is_enterprise_app:
+        artifact_type = self.object.get_type()
+        if artifact_type == Artifact.Type.DATA_ASSET:
+            model_class = DataAsset
+            upgrade_view = "upgrade_data_asset"
+        elif artifact_type.is_raw_declaration:
+            model_class = Declaration
+            upgrade_view = "upgrade_declaration"
+        elif artifact_type == Artifact.Type.ENTERPRISE_APP:
             model_class = EnterpriseApp
             upgrade_view = "upgrade_enterprise_app"
-        elif self.object.is_profile:
+        elif artifact_type == Artifact.Type.PROFILE:
             model_class = Profile
             upgrade_view = "upgrade_profile"
-        elif self.object.is_store_app:
+        elif artifact_type == Artifact.Type.STORE_APP:
             model_class = StoreApp
             upgrade_view = "upgrade_store_app"
             select_related_extra = ("location_asset__asset", "location_asset__location")
@@ -587,6 +682,11 @@ class ArtifactView(PermissionRequiredMixin, DetailView):
         ctx["blueprint_artifacts"] = (self.object.blueprintartifact_set.select_related("blueprint")
                                                                        .order_by("blueprint__name"))
         ctx["blueprint_artifacts_count"] = ctx["blueprint_artifacts"].count()
+        ctx["declaration_refs"] = (self.object.declarationref_set
+                                              .select_related("declaration__artifact_version__artifact")
+                                              .order_by("declaration__artifact_version__artifact__name",
+                                                        "declaration__artifact_version__version"))
+        ctx["declaration_refs_count"] = ctx["declaration_refs"].count()
         return ctx
 
 
@@ -614,7 +714,11 @@ class CreateBlueprintArtifactView(PermissionRequiredMixin, CreateView):
     form_class = BlueprintArtifactForm
 
     def dispatch(self, request, *args, **kwargs):
-        self.artifact = get_object_or_404(Artifact, pk=kwargs["pk"])
+        self.artifact = get_object_or_404(
+            Artifact,
+            pk=kwargs["pk"],
+            type__in=(t for t in Artifact.Type if t.can_be_linked_to_blueprint)
+        )
         return super().dispatch(request, *args, **kwargs)
 
     def get_form_kwargs(self):
@@ -699,11 +803,16 @@ class ArtifactVersionView(PermissionRequiredMixin, DetailView):
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         ctx["artifact"] = self.artifact
-        if self.artifact.is_enterprise_app:
+        artifact_type = self.artifact.get_type()
+        if artifact_type == Artifact.Type.DATA_ASSET:
+            ctx["data_asset"] = self.object.data_asset
+        elif artifact_type.is_raw_declaration:
+            ctx["declaration"] = self.object.declaration
+        elif artifact_type == Artifact.Type.ENTERPRISE_APP:
             ctx["enterprise_app"] = self.object.enterprise_app
-        elif self.artifact.is_profile:
+        elif artifact_type == Artifact.Type.PROFILE:
             ctx["profile"] = self.object.profile
-        elif self.artifact.is_store_app:
+        elif artifact_type == Artifact.Type.STORE_APP:
             ctx["store_app"] = self.object.store_app
         return ctx
 
@@ -804,6 +913,18 @@ class BaseUpgradeArtifactVersionView(PermissionRequiredMixin, TemplateView):
             return self.forms_invalid(object_form, version_form)
 
 
+class UpgradeDataAssetView(BaseUpgradeArtifactVersionView):
+    form = UpgradeDataAssetForm
+    model = "data_asset"
+    model_display = "data asset"
+
+
+class UpgradeDeclarationView(BaseUpgradeArtifactVersionView):
+    form = UpgradeDeclarationForm
+    model = "declaration"
+    model_display = "Declaration"
+
+
 class UpgradeEnterpriseAppView(BaseUpgradeArtifactVersionView):
     form = UpgradeEnterpriseAppForm
     model = "enterprise_app"
@@ -843,8 +964,55 @@ class DeleteArtifactVersionView(PermissionRequiredMixin, DeleteView):
         return response
 
 
+class DownloadDataAssetView(PermissionRequiredMixin, View):
+    permission_required = "mdm.view_artifactversion"
+
+    @cached_property
+    def _file_storage(self):
+        return select_dist_storage()
+
+    @cached_property
+    def _redirect_to_files(self):
+        return file_storage_has_signed_urls(self._file_storage)
+
+    def get(self, request, **kwargs):
+        data_asset = get_object_or_404(DataAsset, artifact_version__pk=kwargs["artifact_version_pk"])
+        if self._redirect_to_files:
+            return HttpResponseRedirect(self._file_storage.url(data_asset.file.name))
+        else:
+            return FileResponse(
+                self._file_storage.open(data_asset.file.name),
+                filename=data_asset.filename or f"data_asset_{data_asset.artifact_version.pk}.zip",
+                as_attachment=True
+            )
+
+
+class DownloadEnterpriseAppView(PermissionRequiredMixin, View):
+    permission_required = "mdm.view_artifactversion"
+
+    @cached_property
+    def _file_storage(self):
+        return select_dist_storage()
+
+    @cached_property
+    def _redirect_to_files(self):
+        return file_storage_has_signed_urls(self._file_storage)
+
+    def get(self, request, **kwargs):
+        enterprise_app = get_object_or_404(EnterpriseApp, artifact_version__pk=kwargs["artifact_version_pk"])
+        package_file = enterprise_app.package
+        if self._redirect_to_files:
+            return HttpResponseRedirect(self._file_storage.url(package_file.name))
+        else:
+            return FileResponse(
+                self._file_storage.open(package_file.name),
+                filename=enterprise_app.filename or f"enterprise_app_{enterprise_app.artifact_version.pk}.pkg",
+                as_attachment=True
+            )
+
+
 class DownloadProfileView(PermissionRequiredMixin, View):
-    permission_required = "mdm.view_artifact"
+    permission_required = "mdm.view_artifactversion"
 
     def get(self, request, **kwargs):
         profile = get_object_or_404(Profile, artifact_version__pk=kwargs["artifact_version_pk"])
@@ -1119,6 +1287,10 @@ class CreateSCEPConfigView(PermissionRequiredMixin, TemplateView):
         if not microsoft_ca_form:
             microsoft_ca_form = MicrosoftCAChallengeForm(prefix="mc")
         context["microsoft_ca_form"] = microsoft_ca_form
+        okta_ca_form = kwargs.get("okta_ca_form")
+        if not okta_ca_form:
+            okta_ca_form = OktaCAChallengeForm(prefix="oc")
+        context["okta_ca_form"] = okta_ca_form
         static_form = kwargs.get("static_form")
         if not static_form:
             static_form = StaticChallengeForm(prefix="s")
@@ -1128,11 +1300,14 @@ class CreateSCEPConfigView(PermissionRequiredMixin, TemplateView):
     def post(self, request, *args, **kwargs):
         scep_config_form = SCEPConfigForm(request.POST, prefix="sc")
         microsoft_ca_form = MicrosoftCAChallengeForm(request.POST, prefix="mc")
+        okta_ca_form = OktaCAChallengeForm(request.POST, prefix="oc")
         static_form = StaticChallengeForm(request.POST, prefix="s")
         if scep_config_form.is_valid():
             challenge_type = SCEPChallengeType[scep_config_form.cleaned_data["challenge_type"]]
             if challenge_type == SCEPChallengeType.MICROSOFT_CA:
                 challenge_form = microsoft_ca_form
+            elif challenge_type == SCEPChallengeType.OKTA_CA:
+                challenge_form = okta_ca_form
             elif challenge_type == SCEPChallengeType.STATIC:
                 challenge_form = static_form
             if challenge_form.is_valid():
@@ -1144,6 +1319,7 @@ class CreateSCEPConfigView(PermissionRequiredMixin, TemplateView):
             return self.render_to_response(
                 self.get_context_data(scep_config_form=scep_config_form,
                                       microsoft_ca_form=microsoft_ca_form,
+                                      okta_ca_form=okta_ca_form,
                                       static_form=static_form)
             )
 
@@ -1158,7 +1334,7 @@ class UpdateSCEPConfigView(PermissionRequiredMixin, TemplateView):
     permission_required = "mdm.change_scepconfig"
 
     def dispatch(self, request, *args, **kwargs):
-        self.scep_config = get_object_or_404(SCEPConfig, pk=kwargs["pk"])
+        self.scep_config = get_object_or_404(SCEPConfig, pk=kwargs["pk"], provisioning_uid__isnull=True)
         self.challenge_type = SCEPChallengeType[self.scep_config.challenge_type]
         return super().dispatch(request, *args, **kwargs)
 
@@ -1183,6 +1359,17 @@ class UpdateSCEPConfigView(PermissionRequiredMixin, TemplateView):
                 )
             )
         context["microsoft_ca_form"] = microsoft_ca_form
+        okta_ca_form = kwargs.get("okta_ca_form")
+        if not okta_ca_form:
+            okta_ca_form = OktaCAChallengeForm(
+                prefix="oc",
+                initial=(
+                    self.scep_config.get_challenge_kwargs()
+                    if self.challenge_type == SCEPChallengeType.OKTA_CA
+                    else None
+                )
+            )
+        context["okta_ca_form"] = okta_ca_form
         static_form = kwargs.get("static_form")
         if not static_form:
             static_form = StaticChallengeForm(
@@ -1211,6 +1398,15 @@ class UpdateSCEPConfigView(PermissionRequiredMixin, TemplateView):
                 else None
             )
         )
+        okta_ca_form = OktaCAChallengeForm(
+            request.POST,
+            prefix="oc",
+            initial=(
+                self.scep_config.get_challenge_kwargs()
+                if self.challenge_type == SCEPChallengeType.OKTA_CA
+                else None
+            )
+        )
         static_form = StaticChallengeForm(
             request.POST,
             prefix="s",
@@ -1224,6 +1420,8 @@ class UpdateSCEPConfigView(PermissionRequiredMixin, TemplateView):
             challenge_type = SCEPChallengeType[scep_config_form.cleaned_data["challenge_type"]]
             if challenge_type == SCEPChallengeType.MICROSOFT_CA:
                 challenge_form = microsoft_ca_form
+            elif challenge_type == SCEPChallengeType.OKTA_CA:
+                challenge_form = okta_ca_form
             elif challenge_type == SCEPChallengeType.STATIC:
                 challenge_form = static_form
             if challenge_form.is_valid():
@@ -1235,6 +1433,7 @@ class UpdateSCEPConfigView(PermissionRequiredMixin, TemplateView):
             return self.render_to_response(
                 self.get_context_data(scep_config_form=scep_config_form,
                                       microsoft_ca_form=microsoft_ca_form,
+                                      okta_ca_form=okta_ca_form,
                                       static_form=static_form)
             )
 

@@ -3,19 +3,25 @@ from rest_framework import serializers
 from zentral.conf import settings
 from zentral.contrib.inventory.models import EnrollmentSecret, Tag
 from zentral.contrib.inventory.serializers import EnrollmentSecretSerializer
+from .conf import monolith_conf
 from .models import (Catalog, Condition, Enrollment, Manifest, ManifestCatalog, ManifestSubManifest,
-                     PkgInfoName, Repository, RepositoryBackend, SubManifest, SubManifestPkgInfo)
+                     ManifestEnrollmentPackage, PkgInfoName, Repository, RepositoryBackend,
+                     SubManifest, SubManifestPkgInfo)
+from .repository_backends.azure import AzureRepositorySerializer
 from .repository_backends.s3 import S3RepositorySerializer
 
 
 class RepositorySerializer(serializers.ModelSerializer):
+    azure_kwargs = AzureRepositorySerializer(source="get_azure_kwargs", required=False)
     s3_kwargs = S3RepositorySerializer(source="get_s3_kwargs", required=False)
 
     class Meta:
         model = Repository
         fields = (
             "id",
+            "provisioning_uid",
             "backend",
+            "azure_kwargs",
             "s3_kwargs",
             "name",
             "meta_business_unit",
@@ -38,7 +44,11 @@ class RepositorySerializer(serializers.ModelSerializer):
     def validate(self, data):
         data = super().validate(data)
         backend = data.get("backend")
-        if backend == RepositoryBackend.S3:
+        if backend == RepositoryBackend.AZURE:
+            data["backend_kwargs"] = data.pop("get_azure_kwargs")
+            if not data["backend_kwargs"]:
+                raise serializers.ValidationError({"azure_kwargs": "This field is required."})
+        elif backend == RepositoryBackend.S3:
             data["backend_kwargs"] = data.pop("get_s3_kwargs")
             if not data["backend_kwargs"]:
                 raise serializers.ValidationError({"s3_kwargs": "This field is required."})
@@ -60,6 +70,14 @@ class RepositorySerializer(serializers.ModelSerializer):
         for manifest in repository.manifests():
             manifest.bump_version()
         return repository
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if instance.provisioning_uid:
+            for field in list(ret.keys()):
+                if field == "backend" or "kwargs" in field:
+                    ret.pop(field)
+        return ret
 
 
 class CatalogSerializer(serializers.ModelSerializer):
@@ -170,6 +188,76 @@ class ManifestCatalogSerializer(serializers.ModelSerializer):
         mc = super().save(*args, **kwargs)
         mc.manifest.bump_version()
         return mc
+
+
+class ManifestEnrollmentPackageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ManifestEnrollmentPackage
+        fields = (
+            'id',
+            'manifest',
+            'tags',
+            'builder',
+            'enrollment_pk',
+            'version',
+            'created_at',
+            'updated_at',
+        )
+        read_only_fields = (
+            'version',
+        )
+        extra_kwargs = {
+            'enrollment_pk': {'required': True},
+            "tags": {"allow_empty": True},
+        }
+
+    def validate_builder(self, value):
+        if value not in monolith_conf.enrollment_package_builders:
+            raise serializers.ValidationError("Unknown builder")
+        return value
+
+    def validate(self, data):
+        builder = data.get("builder")
+        manifest = data.get("manifest")
+        enrollment_pk = data.get("enrollment_pk")
+        if builder and enrollment_pk:
+            enrollment_model = monolith_conf.enrollment_package_builders[builder]["class"].form.Meta.model
+            try:
+                self.enrollment = enrollment_model.objects.select_for_update().get(pk=enrollment_pk)
+            except enrollment_model.DoesNotExist:
+                raise serializers.ValidationError("Unknown enrollment")
+            else:
+                if not self.instance and self.enrollment.distributor:
+                    raise serializers.ValidationError({"enrollment_pk": "This enrollment already has a distributor"})
+                if (
+                    manifest
+                    and manifest.meta_business_unit != self.enrollment.secret.meta_business_unit
+                ):
+                    raise serializers.ValidationError("The manifest and enrollment do not have the same business unit")
+        return data
+
+    def create(self, validated_data):
+        mep = super().create(validated_data)
+        self.enrollment.distributor = mep
+        # bumps the mep & manifest verstion, builds the package
+        self.enrollment.save()
+        return mep
+
+    def update(self, instance, validated_data):
+        old_enrollment = instance.get_enrollment()
+        mep = super().update(instance, validated_data)
+        if self.enrollment != old_enrollment:
+            old_enrollment.distributor = None
+            old_enrollment.save()
+            self.enrollment.distributor = mep
+            # bumps the mep & manifest verstion, builds the package
+            self.enrollment.save()
+        else:
+            # bumps the mep & manifest verstion, builds the package
+            old_enrollment.save()
+        # to get the newest version and updated_at
+        mep.refresh_from_db()
+        return mep
 
 
 class ManifestSubManifestSerializer(serializers.ModelSerializer):

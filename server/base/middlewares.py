@@ -1,6 +1,7 @@
 # adapted from https://github.com/mozilla/django-csp
 from functools import partial
 from django.conf import settings
+from django.utils.cache import add_never_cache_headers
 from django.utils.crypto import get_random_string
 from django.utils.functional import SimpleLazyObject
 from http.client import INTERNAL_SERVER_ERROR, NOT_FOUND
@@ -31,8 +32,8 @@ def build_csp_header(request):
     csp_policies = DEFAULT_CSP_POLICIES.copy()
     csp_nonce = getattr(request, '_csp_nonce', None)
     if csp_nonce:
-        csp_policies["script-src"] += " 'nonce-{}'".format(csp_nonce)
-    return ";".join("{} {}".format(k, v) for k, v in csp_policies.items())
+        csp_policies["script-src"] += f" 'nonce-{csp_nonce}'"
+    return ";".join(f"{k} {v}" for k, v in csp_policies.items())
 
 
 def csp_middleware(get_response):
@@ -61,5 +62,14 @@ def deployment_info_middleware(get_response):
     def middleware(request):
         request.zentral_deployment = deployment_info
         return get_response(request)
+
+    return middleware
+
+
+def never_cache_middleware(get_response):
+    def middleware(request):
+        response = get_response(request)
+        add_never_cache_headers(response)
+        return response
 
     return middleware

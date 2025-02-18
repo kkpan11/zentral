@@ -19,7 +19,7 @@ class InstalledApplicationList(Command):
                 or enrolled_device.platform == Platform.MACOS
             ) and (
                 not enrolled_device.user_enrollment
-                or enrolled_device.platform == Platform.IOS
+                or enrolled_device.platform in (Platform.IOS, Platform.IPADOS)
             )
         )
 
@@ -75,7 +75,7 @@ class InstalledApplicationList(Command):
             self.target.update_target_artifact(
                 self.artifact_version,
                 TargetArtifact.Status.INSTALLED,
-                allow_reinstall=True,
+                unique_install_identifier=self.uuid,
             )
         elif error:
             self.target.update_target_artifact(

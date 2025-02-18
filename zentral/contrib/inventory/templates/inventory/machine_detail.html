@@ -1,11 +1,11 @@
 {% extends 'base.html' %}
-{% load incidents_extras inventory_extras %}
+{% load base_extras incidents_extras inventory_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
     <li class="breadcrumb-item"><a href="/">Home</a></li>
     <li class="breadcrumb-item"><a href="{% url 'inventory:index' %}">Inventory machines</a></li>
-    <li class="breadcrumb-item active">{{ serial_number }}</li>
+    <li class="breadcrumb-item active">{{ serial_number|privacywrapper }}</li>
 </ol>
 
 <div class="row">
@@ -13,7 +13,7 @@
     <h2>
       {% machine_type_icon machine %}
       {% machine_platform_icon machine %}
-      {% if machine.computer_name %}{{ machine.computer_name }} / {% endif %}{{ serial_number }}
+      {% if machine.computer_name %}{{ machine.computer_name }} / {% endif %}{{ serial_number|privacywrapper }}
     </h2>
 
     <p>
@@ -69,22 +69,25 @@
         <span class="bi bi bi-gear" aria-hidden="true"></span> profiles
       </a>
       {% endif %}
-      {% if can_manage_tags or can_archive_machine %}
+      {% if actions %}
       <div class="btn-group">
         <button type="button" class="btn btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
           Action <span class="caret"></span>
         </button>
         <ul class="dropdown-menu">
-          {% if can_manage_tags %}
-          <li>
-            <a href="{% url 'inventory:machine_tags' machine.get_urlsafe_serial_number %}" class="dropdown-item">Manage tags</a>
-          </li>
+          {% for category, links in actions %}
+          {% if category %}
+          <li><span class="dropdown-item disabled">{{ category }}</span></li>
           {% endif %}
-          {% if can_archive_machine %}
+          {% for link, disabled, anchor_text, display_class in links %}
           <li>
-            <a href="{% url 'inventory:archive_machine' machine.get_urlsafe_serial_number %}" class="dropdown-item"><span class="text-danger">Archive</span></a>
+            <a href="{{ link }}" class="dropdown-item{% if disabled %} disabled{% endif %}{% if display_class %} text-{{ display_class }}{% endif %}">{{ anchor_text }}</a>
           </li>
+          {% endfor %}
+          {% if not forloop.last %}
+          <li><hr class="dropdown-divider"></li>
           {% endif %}
+          {% endfor %}
         </ul>
       </div>
       {% endif %}
@@ -134,7 +137,7 @@
         {% endif %}
         {% if system_info.hardware_serial %}
         <dt class="col-sm-3 text-md-end">Hardware serial</dt>
-        <dd class="col-sm-9">{{ system_info.hardware_serial }}</dd>
+        <dd class="col-sm-9">{{ system_info.hardware_serial|privacywrapper }}</dd>
         {% endif %}
         {% if system_info.cpu_brand %}
         <dt class="col-sm-3 text-md-end">CPU brand</dt>
@@ -398,7 +401,13 @@
         <dt class="col-sm-3 text-md-end">Source</dt>
         <dd class="col-sm-9">{{ principal_user.source.get_type_display }}</dd>
         <dt class="col-sm-3 text-md-end">Unique ID</dt>
-        <dd class="col-sm-9">{{ principal_user.unique_id }}</dd>
+        <dd class="col-sm-9">
+          {% if principal_user.realm_user and perms.realms.view_realmuser %}
+          <a href="{{ principal_user.realm_user.get_absolute_url }}">{{ principal_user.unique_id }}</a>
+          {% else %}
+          {{ principal_user.unique_id }}
+          {% endif %}
+        </dd>
         <dt class="col-sm-3 text-md-end">Principal name</dt>
         <dd class="col-sm-9">{{ principal_user.principal_name }}</dd>
         {% if principal_user.display_name %}
@@ -463,7 +472,12 @@
   </div><!-- end col-md-6 -->
   <div class="col-md-6">
     {% if perms.compliance_checks.view_machinestatus %}
-    <h3>Compliance check{{ compliance_check_statuses|length|pluralize }} ({{ compliance_check_statuses|length }})</h3>
+    <h3>Compliance check{{ compliance_check_total|pluralize }} ({{ compliance_check_total }})</h3>
+    {% if compliance_check_total %}
+    <p>
+      {{ compliance_check_ok }} OK{% if compliance_check_failed %}, {{ compliance_check_failed }} Failed{% endif %}{% if compliance_check_pending %}, {{ compliance_check_pending }} Pending{% endif %}{% if compliance_check_unknown %}, {{ compliance_check_unknown }} Unknown{% endif %}
+    </p>
+    {% endif %}
     {% if compliance_check_statuses %}
     <table class="table table-striped align-middle table-hover">
       <thead>
@@ -572,7 +586,7 @@
   }
 
   function showFirstTab() {
-    const source = $('a[data-toggle="tab"]').first().tab("show").data("source");
+    const source = $('a[data-bs-toggle="tab"]').first().tab("show").data("source");
     updateHash(source);
   }
 
@@ -581,7 +595,7 @@
   }
 
   $(document).ready(function(){
-    $('a[data-toggle="tab"]').click(function(event){
+    $('a[data-bs-toggle="tab"]').click(function(event){
       event.preventDefault();
       $(this).tab('show');
     }).on('shown.bs.tab', function (e) {

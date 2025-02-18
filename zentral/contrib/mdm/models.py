@@ -1,6 +1,9 @@
 import datetime
+from functools import partial
 import hashlib
 import logging
+import mimetypes
+import os.path
 import plistlib
 import uuid
 from django.contrib.postgres.fields import ArrayField, DateRangeField
@@ -16,7 +19,7 @@ from django.utils.functional import cached_property
 from django.utils.text import slugify
 from django.utils.timesince import timesince
 from django.utils.translation import gettext_lazy as _
-from realms.models import Realm, RealmUser
+from realms.models import Realm, RealmGroup, RealmUser
 from zentral.conf import settings
 from zentral.contrib.inventory.models import EnrollmentSecret, EnrollmentSecretRequest, MetaMachine, Tag
 from zentral.core.incidents.models import Severity
@@ -25,6 +28,7 @@ from zentral.utils.iso_3166_1 import ISO_3166_1_ALPHA_2_CHOICES
 from zentral.utils.iso_639_1 import ISO_639_1_CHOICES
 from zentral.utils.os_version import make_comparable_os_version
 from zentral.utils.payloads import get_payload_identifier
+from zentral.utils.storage import select_dist_storage
 from zentral.utils.time import naive_truncated_isoformat
 from .exceptions import EnrollmentSessionStatusError
 from .scep import SCEPChallengeType, get_scep_challenge, load_scep_challenge
@@ -53,15 +57,36 @@ def get_platform_values():
 # Push certificates
 
 
+class PushCertificateManager(models.Manager):
+    def for_update(self):
+        return self.filter(provisioning_uid__isnull=True)
+
+    def for_deletion(self):
+        return self.for_update().annotate(
+            enrolled_device_count=Count("enrolleddevice"),
+            dep_enrollment_count=Count("depenrollment"),
+            ota_enrollment_count=Count("otaenrollment"),
+            user_enrollment_count=Count("userenrollment"),
+        ).filter(
+            enrolled_device_count=0,
+            dep_enrollment_count=0,
+            ota_enrollment_count=0,
+            user_enrollment_count=0,
+        )
+
+
 class PushCertificate(models.Model):
+    provisioning_uid = models.CharField(max_length=256, unique=True, null=True, editable=False)
     name = models.CharField(max_length=256, unique=True)
-    topic = models.CharField(max_length=256, unique=True)
-    not_before = models.DateTimeField()
-    not_after = models.DateTimeField()
-    certificate = models.BinaryField()
-    private_key = models.TextField()
+    topic = models.CharField(max_length=256, null=True, unique=True, editable=False)
+    not_before = models.DateTimeField(null=True, editable=False)
+    not_after = models.DateTimeField(null=True, editable=False)
+    certificate = models.BinaryField(null=True)
+    private_key = models.TextField(default="", editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = PushCertificateManager()
 
     class Meta:
         ordering = ('name', 'topic')
@@ -73,17 +98,17 @@ class PushCertificate(models.Model):
         return reverse("mdm:push_certificate", args=(self.pk,))
 
     def can_be_deleted(self):
-        return (
-            self.enrolleddevice_set.count() == 0
-            and self.depenrollment_set.count() == 0
-            and self.otaenrollment_set.count() == 0
-            and self.userenrollment_set.count() == 0
-        )
+        return PushCertificate.objects.for_deletion().filter(pk=self.pk).exists()
+
+    def can_be_updated(self):
+        return PushCertificate.objects.for_update().filter(pk=self.pk).exists()
 
     # secret
 
     def _get_secret_engine_kwargs(self, field):
-        return {"name": self.name, "model": "mdm.pushcertificate", "field": field}
+        if not self.pk:
+            raise ValueError("PushCertificate must have a pk")
+        return {"pk": self.pk, "model": "mdm.pushcertificate", "field": field}
 
     def get_private_key(self):
         return decrypt(self.private_key, **self._get_secret_engine_kwargs("private_key"))
@@ -460,6 +485,7 @@ class Blueprint(models.Model):
 
 
 class SCEPConfig(models.Model):
+    provisioning_uid = models.CharField(max_length=256, unique=True, null=True, editable=False)
     name = models.CharField(max_length=256, unique=True)
     url = models.URLField()
     key_usage = models.IntegerField(choices=((0, 'None (0)'),
@@ -501,10 +527,24 @@ class SCEPConfig(models.Model):
 
     def can_be_deleted(self):
         return (
-            self.depenrollment_set.count() == 0
+            self.provisioning_uid is None
+            and self.depenrollment_set.count() == 0
             and self.otaenrollment_set.count() == 0
             and self.userenrollment_set.count() == 0
         )
+
+    def can_be_updated(self):
+        return self.provisioning_uid is None
+
+    def _get_CHALLENGE_TYPE_challenge_kwargs(self, challenge_type):
+        if self.challenge_type == challenge_type.name:
+            return self.get_challenge_kwargs()
+
+    def __getattr__(self, name):
+        for challenge_type in SCEPChallengeType:
+            if name == f"get_{challenge_type.name.lower()}_challenge_kwargs":
+                return partial(self._get_CHALLENGE_TYPE_challenge_kwargs, challenge_type)
+        raise AttributeError
 
 
 # Apps and (not!) Books
@@ -1033,6 +1073,7 @@ class EnrolledDevice(models.Model):
         return (
             self.checkout_at is None
             and self.push_certificate is not None
+            and self.push_certificate.certificate is not None
             and self.push_certificate.not_before < now
             and now < self.push_certificate.not_after
             and self.token is not None
@@ -1080,7 +1121,7 @@ class EnrolledDevice(models.Model):
             "  'DEP' enrollment_type, e.name enrollment_name, e.id enrollment_id"
             "  FROM mdm_depenrollmentsession s"
             "  JOIN mdm_depenrollment e ON (s.dep_enrollment_id = e.id)"
-            "  WHERE s.enrolled_device_id = %s"
+            "  WHERE s.enrolled_device_id = %s "
 
             "UNION"
 
@@ -1088,7 +1129,7 @@ class EnrolledDevice(models.Model):
             "  'OTA' enrollment_type, e.name enrollment_name, e.id enrollment_id"
             "  FROM mdm_otaenrollmentsession s"
             "  JOIN mdm_otaenrollment e ON (s.ota_enrollment_id = e.id)"
-            "  WHERE s.enrolled_device_id = %s"
+            "  WHERE s.enrolled_device_id = %s "
 
             "UNION"
 
@@ -1104,7 +1145,7 @@ class EnrolledDevice(models.Model):
             "  LEFT JOIN mdm_depenrollment d ON (s.dep_enrollment_id = d.id)"
             "  LEFT JOIN mdm_otaenrollment o ON (s.ota_enrollment_id = o.id)"
             "  LEFT JOIN mdm_userenrollment u ON (s.user_enrollment_id = u.id)"
-            "  WHERE s.enrolled_device_id = %s"
+            "  WHERE s.enrolled_device_id = %s "
 
             "UNION"
 
@@ -1123,6 +1164,31 @@ class EnrolledDevice(models.Model):
         columns = [c.name for c in cursor.description]
         for t in cursor.fetchall():
             yield dict(zip(columns, t))
+
+    @property
+    def bootstrap_token_escrowed(self):
+        if self.bootstrap_token:
+            return True
+        return False
+
+    @property
+    def filevault_enabled(self):
+        try:
+            return self.security_info["FDE_Enabled"]
+        except (KeyError, TypeError):
+            pass
+
+    @property
+    def filevault_prk_escrowed(self):
+        if self.filevault_prk:
+            return True
+        return False
+
+    @property
+    def recovery_password_escrowed(self):
+        if self.recovery_password:
+            return True
+        return False
 
 
 class EnrolledUser(models.Model):
@@ -1186,9 +1252,6 @@ class EnrollmentSession(models.Model):
         if serial_number:
             return MetaMachine(serial_number).get_urlsafe_serial_number()
 
-    def get_payload_name(self):
-        return "Zentral - {prefix} Enrollment SCEP".format(prefix=" - ".join(self.get_prefix().split("$")))
-
     def is_completed(self):
         return self.status == self.COMPLETED
 
@@ -1214,10 +1277,26 @@ class EnrollmentSession(models.Model):
         return self.created_at
 
 
+class RealmGroupTagMapping(models.Model):
+    realm_group = models.ForeignKey(RealmGroup, on_delete=models.CASCADE, verbose_name="Group")
+    tag = models.ForeignKey(Tag, on_delete=models.CASCADE)
+
+    class Meta:
+        unique_together = (("realm_group", "tag"),)
+
+    def __str__(self):
+        return f"{self.realm_group} → {self.tag}"
+
+    def get_absolute_url(self):
+        return reverse("mdm:realm_group_tag_mappings") + f"#rgtm-{self.pk}"
+
+
 # Abstract MDM enrollment model
 
 
 class MDMEnrollment(models.Model):
+    display_name = models.CharField(max_length=128, default="Zentral MDM",  # ! Terraform Provider default value too !
+                                    help_text="Name displayed in the device settings")
     push_certificate = models.ForeignKey(PushCertificate, on_delete=models.PROTECT)
 
     scep_config = models.ForeignKey(SCEPConfig, on_delete=models.PROTECT)
@@ -1239,13 +1318,32 @@ class MDMEnrollment(models.Model):
     class Meta:
         abstract = True
 
+    def can_be_deleted(self):
+        raise NotImplementedError
+
+    def delete(self, *args, **kwargs):
+        if self.can_be_deleted():
+            self.enrollment_secret.delete()
+            super().delete(*args, **kwargs)
+        else:
+            raise ValueError(f"{self.__class__.__name__} {self.pk} cannot be deleted")
+
+    def serialize_for_event(self):
+        return {
+            "pk": self.pk,
+            "name": self.name,
+            "realm": self.realm.serialize_for_event(keys_only=True) if self.realm else None,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at
+        }
+
 
 # OTA Enrollment
 
 
 class OTAEnrollment(MDMEnrollment):
     name = models.CharField(max_length=256, unique=True)
-    enrollment_secret = models.OneToOneField(EnrollmentSecret, on_delete=models.PROTECT,
+    enrollment_secret = models.OneToOneField(EnrollmentSecret, on_delete=models.CASCADE,
                                              related_name="ota_enrollment")
     # if linked to an auth realm, a user has to authenticate to get the mdm payload.
 
@@ -1256,12 +1354,9 @@ class OTAEnrollment(MDMEnrollment):
         return self.name
 
     def serialize_for_event(self):
-        d = {"pk": self.pk,
-             "name": self.name,
-             "created_at": self.created_at,
-             "updated_at": self.updated_at}
+        d = super().serialize_for_event()
         d.update(self.enrollment_secret.serialize_for_event())
-        return {"ota_enrollment": d}
+        return d
 
     def get_absolute_url(self):
         return reverse("mdm:ota_enrollment", args=(self.pk,))
@@ -1277,6 +1372,9 @@ class OTAEnrollment(MDMEnrollment):
             self.enrollment_secret.revoked_at = timezone.now()
             self.enrollment_secret.save()
             self.save()
+
+    def can_be_deleted(self):
+        return self.otaenrollmentsession_set.count() == 0 and self.reenrollmentsession_set.count() == 0
 
 
 class OTAEnrollmentSessionManager(models.Manager):
@@ -1357,7 +1455,7 @@ class OTAEnrollmentSession(EnrollmentSession):
             raise ValueError("Wrong enrollment sessions status")
 
     def serialize_for_event(self):
-        return super().serialize_for_event("ota", self.ota_enrollment.serialize_for_event())
+        return super().serialize_for_event("ota", {"ota_enrollment": self.ota_enrollment.serialize_for_event()})
 
     def get_blueprint(self):
         return self.ota_enrollment.blueprint
@@ -1564,12 +1662,17 @@ class DEPVirtualServer(models.Model):
 
 
 class DEPEnrollment(MDMEnrollment):
+
+    class UsernamePattern(models.TextChoices):
+        DEVICE_USERNAME = "$REALM_USER.DEVICE_USERNAME", "Username prefix without '.'"
+        EMAIL_PREFIX = "$REALM_USER.EMAIL_PREFIX", "Email prefix"
+
     # link with the Apple DEP web services
     uuid = models.UUIDField(unique=True, editable=False)
     virtual_server = models.ForeignKey(DEPVirtualServer, on_delete=models.CASCADE)
 
     # to protect the dep enrollment endpoint. Link to the meta business unit too
-    enrollment_secret = models.OneToOneField(EnrollmentSecret, on_delete=models.PROTECT,
+    enrollment_secret = models.OneToOneField(EnrollmentSecret, on_delete=models.CASCADE,
                                              related_name="dep_enrollment", editable=False)
 
     # Authentication
@@ -1577,10 +1680,25 @@ class DEPEnrollment(MDMEnrollment):
     # if linked to a realm, a user has to authenticate to get the mdm payload.
     # if realm, use the realm user either to auto populate the user form
     # or auto create the admin
-    use_realm_user = models.BooleanField(default=False)
+    use_realm_user = models.BooleanField(
+        default=False,
+        help_text="Use this option to prefill the account creation info with the realm user attributes."
+    )
+    # if the realm user is used, the following attribute determines how the
+    # the account username is derived from the realm user attributes.
+    # see zentral.contrib.mdm.payloads.substitute_variables
+    username_pattern = models.CharField(
+        max_length=255, choices=UsernamePattern.choices,
+        blank=True,
+        help_text="The pattern used to derive the account username from the realm user attributes."
+    )
     # if the realm user is not an admin, we will only use the info
     # to autopopulate the user form, and we will need a default admin
-    realm_user_is_admin = models.BooleanField(default=True)
+    realm_user_is_admin = models.BooleanField(
+        default=True,
+        help_text="If false, the user created from the realm user during the Setup Assistant will be "
+                  "a regular user, and the admin account information is required."
+    )
     # optional admin account info
     admin_full_name = models.CharField(max_length=80, blank=True, null=True)
     admin_short_name = models.CharField(max_length=32, blank=True, null=True)
@@ -1630,16 +1748,19 @@ class DEPEnrollment(MDMEnrollment):
         return self.depdevice_set.exclude(last_op_type=DEPDevice.OP_TYPE_DELETED)
 
     def serialize_for_event(self):
-        return {"dep_enrollment": {"uuid": self.pk,
-                                   "name": self.name,
-                                   "created_at": self.created_at,
-                                   "updated_at": self.updated_at}}
+        return {"uuid": self.pk,
+                "name": self.name,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at}
 
     def has_hardcoded_admin(self):
         return self.admin_full_name and self.admin_short_name and self.admin_password_hash
 
     def requires_account_configuration(self):
         return self.use_realm_user or self.has_hardcoded_admin()
+
+    def can_be_deleted(self):
+        return self.depenrollmentsession_set.count() == 0 and self.reenrollmentsession_set.count() == 0
 
 
 class DEPDevice(models.Model):
@@ -1770,7 +1891,7 @@ class DEPEnrollmentSession(EnrollmentSession):
             raise ValueError("Wrong enrollment sessions status")
 
     def serialize_for_event(self):
-        return super().serialize_for_event("dep", self.dep_enrollment.serialize_for_event())
+        return super().serialize_for_event("dep", {"dep_enrollment": self.dep_enrollment.serialize_for_event()})
 
     def get_blueprint(self):
         return self.dep_enrollment.blueprint
@@ -1815,7 +1936,7 @@ class DEPEnrollmentSession(EnrollmentSession):
 class UserEnrollment(MDMEnrollment):
     name = models.CharField(max_length=256, unique=True)
 
-    enrollment_secret = models.OneToOneField(EnrollmentSecret, on_delete=models.PROTECT,
+    enrollment_secret = models.OneToOneField(EnrollmentSecret, on_delete=models.CASCADE,
                                              related_name="user_enrollment")
     # Realm is required, but not in the database schema.
     # User enrollments via profiles, with authentication in the device is deprecated
@@ -1833,7 +1954,7 @@ class UserEnrollment(MDMEnrollment):
              "created_at": self.created_at,
              "updated_at": self.updated_at}
         d.update(self.enrollment_secret.serialize_for_event())
-        return {"user_enrollment": d}
+        return d
 
     def get_absolute_url(self):
         return reverse("mdm:user_enrollment", args=(self.pk,))
@@ -1851,6 +1972,9 @@ class UserEnrollment(MDMEnrollment):
             self.enrollment_secret.revoked_at = timezone.now()
             self.enrollment_secret.save()
             self.save()
+
+    def can_be_deleted(self):
+        return self.userenrollmentsession_set.count() == 0 and self.reenrollmentsession_set.count() == 0
 
 
 class UserEnrollmentSessionManager(models.Manager):
@@ -1907,7 +2031,7 @@ class UserEnrollmentSession(EnrollmentSession):
             raise ValueError("Wrong enrollment sessions status")
 
     def serialize_for_event(self):
-        return super().serialize_for_event("user", self.user_enrollment.serialize_for_event())
+        return super().serialize_for_event("user", {"user_enrollment": self.user_enrollment.serialize_for_event()})
 
     def get_blueprint(self):
         return self.user_enrollment.blueprint
@@ -2100,12 +2224,14 @@ class ArtifactManager(models.Manager):
             ua_count=Count("artifactversion__userartifact"),
             dc_count=Count("artifactversion__devicecommand"),
             uc_count=Count("artifactversion__usercommand"),
+            ref_count=Count("declarationref"),
         ).filter(
             bpa_count=0,
             da_count=0,
             ua_count=0,
             dc_count=0,
             uc_count=0,
+            ref_count=0,
         )
 
 
@@ -2116,9 +2242,42 @@ class Artifact(models.Model):
         REMOVAL = "Removal"
 
     class Type(models.TextChoices):
+        ACTIVATION = "Activation"
+        ASSET = "Asset"
+        CONFIGURATION = "Configuration"
+        DATA_ASSET = "Data Asset"
         ENTERPRISE_APP = "Enterprise App"
+        MANUAL_CONFIGURATION = "Configuration (manual)"
         PROFILE = "Profile"
         STORE_APP = "Store App"
+
+        @property
+        def is_activation(self):
+            return self.value == self.ACTIVATION
+
+        @property
+        def is_asset(self):
+            return self.value in (self.ASSET, self.DATA_ASSET)
+
+        @property
+        def is_configuration(self):
+            return self.value in (self.CONFIGURATION, self.MANUAL_CONFIGURATION, self.PROFILE)
+
+        @property
+        def is_declaration(self):
+            return self.is_configuration or self.is_asset or self.is_activation
+
+        @property
+        def is_ddm_only(self):
+            return not self.value == self.PROFILE and self.is_declaration
+
+        @property
+        def is_raw_declaration(self):
+            return self.value in (self.ACTIVATION, self.ASSET, self.CONFIGURATION, self.MANUAL_CONFIGURATION)
+
+        @property
+        def can_be_linked_to_blueprint(self):
+            return not self.is_asset and not self.value == self.MANUAL_CONFIGURATION
 
     class ReinstallOnOSUpdate(models.TextChoices):
         NO = "No"
@@ -2162,6 +2321,9 @@ class Artifact(models.Model):
     def get_type(self):
         return self.Type(self.type)
 
+    def get_platforms(self):
+        return [Platform(p) for p in self.platforms]
+
     def get_channel(self):
         return Channel(self.channel)
 
@@ -2170,22 +2332,17 @@ class Artifact(models.Model):
         return self.get_type() in (self.Type.PROFILE, self.Type.STORE_APP)
 
     def blueprints(self):
-        return Blueprint.objects.filter(blueprintartifact__artifact=self)
+        # directly included
+        yield from Blueprint.objects.filter(
+            blueprintartifact__artifact=self
+        )
+        # referenced by a declaration
+        yield from Blueprint.objects.distinct().filter(
+            blueprintartifact__artifact__artifactversion__declaration__declarationref__artifact=self
+        )
 
     def can_be_deleted(self):
         return Artifact.objects.can_be_deleted().filter(pk=self.pk).count() == 1
-
-    @property
-    def is_enterprise_app(self):
-        return self.get_type() == self.Type.ENTERPRISE_APP
-
-    @property
-    def is_profile(self):
-        return self.get_type() == self.Type.PROFILE
-
-    @property
-    def is_store_app(self):
-        return self.get_type() == self.Type.STORE_APP
 
     def serialize_for_event(self, keys_only=False):
         d = {"pk": str(self.pk), "name": self.name}
@@ -2382,6 +2539,112 @@ class ArtifactVersionTag(FilteredBlueprintItemTag):
         unique_together = (("artifact_version", "tag"),)
 
 
+class Declaration(models.Model):
+    artifact_version = models.OneToOneField(ArtifactVersion, related_name="declaration", on_delete=models.CASCADE)
+    type = models.TextField()
+    identifier = models.TextField(db_index=True)
+    server_token = models.TextField(unique=True)
+    payload = models.JSONField()
+
+    def __str__(self):
+        return self.identifier
+
+    def serialize_for_event(self):
+        d = self.artifact_version.serialize_for_event()
+        d.update({
+            "type": self.type,
+            "identifier": self.identifier,
+            "server_token": self.server_token,
+            "payload": self.payload,
+        })
+        return d
+
+    def delete(self, *args, **kwargs):
+        self.artifact_version.delete(*args, **kwargs)
+        super().delete(*args, **kwargs)
+
+    def get_export_filename(self):
+        slug = slugify(self.artifact_version.artifact.name)
+        return f"{slug}_{self.pk}_v{self.artifact_version.version}.json"
+
+    def get_full_dict(self):
+        return {
+            "Type": self.type,
+            "Identifier": self.identifier,
+            "ServerToken": self.server_token,
+            "Payload": self.payload
+        }
+
+
+class DeclarationRef(models.Model):
+    declaration = models.ForeignKey(Declaration, on_delete=models.CASCADE)
+    key = ArrayField(models.CharField(max_length=256, validators=[MinLengthValidator(1)]))
+    artifact = models.ForeignKey(Artifact, on_delete=models.CASCADE)
+
+    class Meta:
+        unique_together = (("declaration", "key"),)
+
+
+def data_asset_path(instance, filename):
+    _, ext = os.path.splitext(filename)
+    return f"mdm/data_assets/{instance.artifact_version.artifact.pk}/{instance.artifact_version.pk}{ext}"
+
+
+# We override the default mimetype for the ".plist" extension.
+# Files can be stored in third party systems via django-storages. See:
+# https://github.com/jschneier/django-storages/blob/b79ea310201e7afd659fe47e2882fe59aae5b517/storages/backends/gcloud.py#L41  # NOQA
+# https://github.com/jschneier/django-storages/blob/b79ea310201e7afd659fe47e2882fe59aae5b517/storages/backends/s3.py#L630  # NOQA
+# This way, we make sure the correct mimetype is stored in the object metadata, and used in the Http response headers.
+PLIST_MIME_TYPE = "text/xml"
+mimetypes.add_type(PLIST_MIME_TYPE, ".plist")
+
+
+class DataAsset(models.Model):
+    class Type(models.TextChoices):
+        PLIST = "PLIST", _("PLIST (.plist)")
+        ZIP = "ZIP", _("ZIP archive (.zip)")
+
+    artifact_version = models.OneToOneField(ArtifactVersion, related_name="data_asset", on_delete=models.CASCADE)
+    type = models.CharField(max_length=256, choices=Type.choices)
+    file = models.FileField(upload_to=data_asset_path, storage=select_dist_storage)
+    filename = models.TextField()
+    file_size = models.BigIntegerField(validators=[MinValueValidator(1)])
+    file_sha256 = models.CharField(max_length=64)
+
+    def __str__(self):
+        return self.filename
+
+    def serialize_for_event(self):
+        d = self.artifact_version.serialize_for_event()
+        d.update({
+            "type": self.type,
+            "filename": self.filename,
+            "file_size": self.file_size,
+            "file_sha256": self.file_sha256,
+        })
+        return d
+
+    def delete(self, *args, **kwargs):
+        self.artifact_version.delete(*args, **kwargs)
+        super().delete(*args, **kwargs)
+
+    def get_type(self):
+        return self.Type(self.type)
+
+    def get_content_type(self):
+        data_type = self.get_type()
+        if data_type == self.Type.PLIST:
+            return PLIST_MIME_TYPE
+        elif data_type == self.Type.ZIP:
+            return "application/zip"
+        logger.error("Unknown content type for type %s", data_type)
+
+    def get_export_filename(self):
+        slug = slugify(self.artifact_version.artifact.name)
+        _, ext = os.path.splitext(self.filename)
+        return f"{slug}_{self.pk}_v{self.artifact_version.version}{ext}"
+
+
 class Profile(models.Model):
     artifact_version = models.OneToOneField(ArtifactVersion, related_name="profile", on_delete=models.CASCADE)
     source = models.BinaryField()
@@ -2437,7 +2700,7 @@ def enterprise_application_package_path(instance, filename):
 
 class EnterpriseApp(models.Model):
     artifact_version = models.OneToOneField(ArtifactVersion, related_name="enterprise_app", on_delete=models.CASCADE)
-    package = models.FileField(upload_to=enterprise_application_package_path)
+    package = models.FileField(upload_to=enterprise_application_package_path, storage=select_dist_storage)
     package_uri = models.TextField(default="")
     package_sha256 = models.CharField(max_length=64)
     package_size = models.BigIntegerField()
@@ -2568,6 +2831,7 @@ class TargetArtifact(models.Model):
         UNINSTALLED = "Uninstalled"
         FAILED = "Failed"
         REMOVAL_FAILED = "RemovalFailed"
+        FORCE_REINSTALL = "ForceReinstall"
 
         @property
         def present(self):
@@ -2587,6 +2851,9 @@ class TargetArtifact(models.Model):
     os_version_at_install_time = models.CharField(max_length=64, null=True)
     # to better identify reinstalls
     unique_install_identifier = models.CharField(max_length=256, default="")
+    install_count = models.IntegerField(default=0)
+    retry_count = models.IntegerField(default=0)
+    max_retry_count = models.IntegerField(default=0)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -2687,7 +2954,7 @@ class SoftwareUpdate(models.Model):
 
     @property
     def comparable_os_version(self):
-        return (self.major, self.minor, self.patch, self.extra)
+        return tuple(e for e in (self.major, self.minor, self.patch, self.extra) if e != "")
 
     def target_os_version(self):
         s = ".".join(

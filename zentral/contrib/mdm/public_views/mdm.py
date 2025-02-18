@@ -8,23 +8,22 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.x509.oid import NameOID
 from django.core import signing
 from django.core.exceptions import SuspiciousOperation
-from django.core.files.storage import default_storage
 from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils.functional import cached_property
 from django.views.generic import View
-from zentral.contrib.inventory.models import MachineTag, MetaBusinessUnit
+from zentral.contrib.inventory.models import MetaBusinessUnit
 from zentral.contrib.mdm.artifacts import Target
 from zentral.contrib.mdm.commands.install_profile import build_payload
 from zentral.contrib.mdm.commands.base import get_command
 from zentral.contrib.mdm.commands.scheduling import get_next_command_response
 from zentral.contrib.mdm.crypto import verify_signed_payload
-from zentral.contrib.mdm.declarations import (build_legacy_profile,
-                                              build_specific_software_update_enforcement,
-                                              build_target_management_status_subscriptions,
-                                              load_legacy_profile_token)
+from zentral.contrib.mdm.declarations import (build_declaration_response,
+                                              load_data_asset_token,
+                                              load_legacy_profile_token,
+                                              DeclarationError)
 from zentral.contrib.mdm.events import MDMRequestEvent
-from zentral.contrib.mdm.inventory import ms_tree_from_payload
+from zentral.contrib.mdm.inventory import ms_tree_from_payload, update_realm_user_machine_tags, MachineTag
 from zentral.contrib.mdm.models import (ArtifactVersion,
                                         Channel, RequestStatus, DeviceCommand, EnrolledDevice, EnrolledUser,
                                         DEPEnrollmentSession, OTAEnrollmentSession,
@@ -32,7 +31,7 @@ from zentral.contrib.mdm.models import (ArtifactVersion,
                                         ReEnrollmentSession, UserEnrollmentSession,
                                         PushCertificate)
 from zentral.utils.certificates import parse_dn
-from zentral.utils.storage import file_storage_has_signed_urls
+from zentral.utils.storage import file_storage_has_signed_urls, select_dist_storage
 from .base import PostEventMixin
 
 
@@ -275,17 +274,17 @@ class CheckinView(MDMView):
             enrolled_device.purge_state(full=True)
 
         # initial machine tagging
-        if not is_reenrollment and self.enrollment_session.realm_user:
-            tags_to_add, tags_to_remove = self.enrollment_session.realm_user.mapped_tags()
-            # add the tags
-            if tags_to_add:
+        if not is_reenrollment:
+            # enrollment tags
+            enrollment_tags = list(self.enrollment_session.enrollment_secret.tags.all())
+            if enrollment_tags:
                 MachineTag.objects.bulk_create((
-                    MachineTag(serial_number=self.serial_number, tag=tag_to_add)
-                    for tag_to_add in tags_to_add
+                    MachineTag(serial_number=self.serial_number, tag=enrollment_tag)
+                    for enrollment_tag in enrollment_tags
                 ), ignore_conflicts=True)
-            # remove the other ones that are automatically managed
-            if tags_to_remove:
-                MachineTag.objects.filter(serial_number=self.serial_number, tag__in=tags_to_remove).delete()
+            # realm group tag mappings
+            if self.enrollment_session.realm_user:
+                update_realm_user_machine_tags(self.enrollment_session.realm_user, self.serial_number)
 
         # update enrollment session
         self.enrollment_session.set_authenticated_status(enrolled_device)
@@ -389,22 +388,11 @@ class CheckinView(MDMView):
             self.target.update_target_with_status_report(json_data)
             self.post_event("success", **event_payload)
             return HttpResponse(status=204)
-        elif endpoint.startswith("declaration"):
-            _, declaration_type, declaration_identifier = endpoint.split("/")
-            event_payload["declaration_type"] = declaration_type
-            event_payload["declaration_identifier"] = declaration_identifier
-            if declaration_identifier.endswith("management-status-subscriptions"):
-                response = build_target_management_status_subscriptions(self.target)
-            elif declaration_identifier.endswith("activation"):
-                response = self.target.activation
-            elif declaration_identifier.endswith("softwareupdate-enforcement-specific"):
-                response = build_specific_software_update_enforcement(self.target)
-                if not response:
-                    self.abort("Could not build specific software update enforcement", **event_payload)
-            elif "legacy-profile" in declaration_identifier:
-                response = build_legacy_profile(self.enrollment_session, self.target, declaration_identifier)
-            else:
-                self.abort("Unknown declaration", **event_payload)
+        elif endpoint.startswith("declaration/"):
+            try:
+                response = build_declaration_response(endpoint, event_payload, self.enrollment_session, self.target)
+            except DeclarationError as e:
+                self.abort(str(e), **event_payload)
         self.post_event("success", **event_payload)
         return JsonResponse(response)
 
@@ -471,8 +459,12 @@ class ConnectView(MDMView):
 
 class EnterpriseAppDownloadView(View):
     @cached_property
+    def _file_storage(self):
+        return select_dist_storage()
+
+    @cached_property
     def _redirect_to_files(self):
-        return file_storage_has_signed_urls()
+        return file_storage_has_signed_urls(self._file_storage)
 
     def get(self, response, *args, **kwargs):
         # TODO limit access
@@ -481,9 +473,36 @@ class EnterpriseAppDownloadView(View):
                                            name="InstallEnterpriseApplication", uuid=kwargs["uuid"])
         package_file = device_command.artifact_version.enterprise_app.package
         if self._redirect_to_files:
-            return HttpResponseRedirect(default_storage.url(package_file.name))
+            return HttpResponseRedirect(self._file_storage.url(package_file.name))
         else:
-            return FileResponse(default_storage.open(package_file.name), as_attachment=True)
+            return FileResponse(self._file_storage.open(package_file.name), as_attachment=True)
+
+
+# DDM
+
+
+class DataAssetDownloadView(View):
+    @cached_property
+    def _file_storage(self):
+        return select_dist_storage()
+
+    @cached_property
+    def _redirect_to_files(self):
+        return file_storage_has_signed_urls(self._file_storage)
+
+    def get(self, response, *args, **kwargs):
+        # TODO DownloadDataAssetEvent with mdm namespace
+        try:
+            data_asset, enrollment_session, enrolled_user = load_data_asset_token(kwargs["token"])
+        except signing.BadSignature:
+            raise SuspiciousOperation("Bad legacy data asset token signature")
+        except ArtifactVersion.DoesNotExist:
+            raise Http404
+        if self._redirect_to_files:
+            return HttpResponseRedirect(self._file_storage.url(data_asset.file.name))
+        else:
+            return FileResponse(self._file_storage.open(data_asset.file.name),
+                                as_attachment=True, content_type=data_asset.get_content_type())
 
 
 class ProfileDownloadView(View):

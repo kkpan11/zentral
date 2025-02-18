@@ -1,12 +1,91 @@
+from uuid import uuid4
 from django.shortcuts import get_object_or_404
+from django_filters import rest_framework as filters
+from rest_framework import status
+from rest_framework.authentication import SessionAuthentication
+from rest_framework.generics import ListAPIView
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from accounts.api_authentication import APITokenAuthentication
+from zentral.contrib.mdm.artifacts import Target
+from zentral.contrib.mdm.commands import EraseDevice, DeviceLock
 from zentral.contrib.mdm.events import post_filevault_prk_viewed_event, post_recovery_password_viewed_event
-from zentral.contrib.mdm.models import EnrolledDevice
-from zentral.utils.drf import DjangoPermissionRequired
+from zentral.contrib.mdm.models import Channel, EnrolledDevice
+from zentral.contrib.mdm.serializers import DeviceCommandSerializer, EnrolledDeviceSerializer
+from zentral.utils.drf import DefaultDjangoModelPermissions, DjangoPermissionRequired
+
+
+class EnrolledDeviceList(ListAPIView):
+    queryset = EnrolledDevice.objects.all()
+    serializer_class = EnrolledDeviceSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ('udid', 'serial_number')
+
+
+class BlockEnrolledDevice(APIView):
+    permission_required = "mdm.change_enrolleddevice"
+    permission_classes = [DjangoPermissionRequired]
+
+    def post(self, request, *args, **kwargs):
+        enrolled_device = get_object_or_404(EnrolledDevice, pk=kwargs["pk"])
+        if enrolled_device.blocked_at:
+            return Response({"detail": "Device already blocked."}, status=status.HTTP_400_BAD_REQUEST)
+        enrolled_device.block()
+        enrolled_device.refresh_from_db()
+        serializer = EnrolledDeviceSerializer(enrolled_device)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class UnblockEnrolledDevice(APIView):
+    permission_required = "mdm.change_enrolleddevice"
+    permission_classes = [DjangoPermissionRequired]
+
+    def post(self, request, *args, **kwargs):
+        enrolled_device = get_object_or_404(EnrolledDevice, pk=kwargs["pk"])
+        if not enrolled_device.blocked_at:
+            return Response({"detail": "Device not blocked."}, status=status.HTTP_400_BAD_REQUEST)
+        enrolled_device.unblock()
+        enrolled_device.refresh_from_db()
+        serializer = EnrolledDeviceSerializer(enrolled_device)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class CreateEnrolledDeviceCommandView(APIView):
+    permission_required = "mdm.add_devicecommand"
+    permission_classes = [DjangoPermissionRequired]
+
+    def post(self, request, *args, **kwargs):
+        enrolled_device = get_object_or_404(EnrolledDevice, pk=kwargs["pk"])
+        if not self.command_class.verify_target(Target(enrolled_device)):
+            return Response({"detail": "Invalid target."}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = self.command_class.serializer_class(
+            channel=Channel.DEVICE,
+            enrolled_device=enrolled_device,
+            data=request.data
+        )
+        serializer.is_valid(raise_exception=True)
+        uuid = uuid4()
+        command = self.command_class.create_for_device(
+            enrolled_device,
+            kwargs=serializer.get_command_kwargs(uuid),
+            queue=True,
+            uuid=uuid
+        )
+        serializer = DeviceCommandSerializer(command.db_command)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class EraseEnrolledDevice(CreateEnrolledDeviceCommandView):
+    command_class = EraseDevice
+
+
+class LockEnrolledDevice(CreateEnrolledDeviceCommandView):
+    command_class = DeviceLock
 
 
 class EnrolledDeviceFileVaultPRK(APIView):
+    authentication_classes = [APITokenAuthentication, SessionAuthentication]
     permission_required = "mdm.view_filevault_prk"
     permission_classes = [DjangoPermissionRequired]
 
@@ -23,6 +102,7 @@ class EnrolledDeviceFileVaultPRK(APIView):
 
 
 class EnrolledDeviceRecoveryPassword(APIView):
+    authentication_classes = [APITokenAuthentication, SessionAuthentication]
     permission_required = "mdm.view_recovery_password"
     permission_classes = [DjangoPermissionRequired]
 

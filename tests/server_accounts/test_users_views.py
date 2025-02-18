@@ -4,12 +4,14 @@ import json
 import operator
 from django.contrib.auth.models import Group, Permission
 from django.core import mail
+from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils.crypto import get_random_string
 import pyotp
 from accounts.models import APIToken, User, UserTOTP, UserWebAuthn
+from accounts.password_validation import PasswordNotAlreadyUsedValidator
 from zentral.conf import ConfigDict, settings
 
 
@@ -32,10 +34,9 @@ class AccountUsersViewsTestCase(TestCase):
                                                  get_random_string(12),
                                                  is_superuser=True)
         # user
-        cls.pwd = get_random_string(18)
         cls.user = User.objects.create_user(get_random_string(19),
                                             "{}@zentral.io".format(get_random_string(12)),
-                                            get_random_string(12))
+                                            get_random_string(18))
         # remote user
         cls.remote_user = User.objects.create_user(get_random_string(19),
                                                    "{}@zentral.io".format(get_random_string(12)),
@@ -82,6 +83,7 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertTemplateUsed(response, "base/index.html")
         self.assertTrue(response.context["request"].user.is_authenticated)
         self.assertEqual(response.context["request"].user, self.ui_user)
+        self.assertEqual(response["Cache-Control"], 'max-age=0, no-cache, no-store, must-revalidate, private')
 
     def test_simple_login_wrong_password(self):
         response = self.client.post(reverse("login"),
@@ -523,7 +525,7 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_self_create_api_token(self):
-        self.login()
+        self.login("accounts.view_user")
         response = self.client.post(reverse("accounts:create_user_api_token", args=(self.ui_user.id,)))
         self.assertTemplateUsed(response, "accounts/user_api_token.html")
         user = response.context["object"]
@@ -811,5 +813,118 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertTemplateUsed(response, "registration/password_reset_done.html")
         self.assertEqual(len(mail.outbox), 1)
         email = mail.outbox[0]
-        self.assertEqual(email.subject, "Password reset on Zentral")
-        self.assertIn(f"Your username, in case you've forgotten: {self.ui_user.username}", email.body)
+        self.assertEqual(email.subject, "Password reset for Zentral")
+        self.assertIn(f"Your username, just in case: {self.ui_user.username}", email.body)
+
+    # password change
+
+    def test_password_change_get(self):
+        self.login()
+        response = self.client.get(reverse("password_change"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+
+    def test_password_change_default_password_policy_1(self):
+        self.login()
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": "123",
+                                     "new_password2": "123"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["This password is too short. It must contain at least 8 characters.",
+                              "This password is too common.",
+                              "This password is entirely numeric."])
+
+    def test_password_change_default_password_policy_2(self):
+        self.login()
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": self.ui_user.username,
+                                     "new_password2": self.ui_user.username},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["The password is too similar to the username."])
+
+    def test_password_change_default_password_policy_no_change(self):
+        self.login()
+        self.assertEqual(self.ui_user.userpasswordhistory_set.count(), 0)
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": self.ui_user_pwd,
+                                     "new_password2": self.ui_user_pwd},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["Please, pick a new password."])
+
+    def test_password_change_default_password_policy_password_already_used(self):
+        new_password = get_random_string(12)
+        self.ui_user.set_password(new_password)
+        self.ui_user.save()
+        self.login()
+        self.assertEqual(self.ui_user.userpasswordhistory_set.count(), 1)
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": new_password,
+                                     "new_password1": self.ui_user_pwd,
+                                     "new_password2": self.ui_user_pwd},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["You have already used that password, try another."])
+
+    def test_password_change_post(self):
+        self.login()
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": "lskdjlkd1",
+                                     "new_password2": "lskdjlkd1"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_done.html")
+
+    # PasswordNotAlreadyUsedValidator
+
+    def test_password_not_already_used_help_text_default(self):
+        v = PasswordNotAlreadyUsedValidator()
+        self.assertEqual(v.get_help_text(), "Your password must not have been used before.")
+
+    def test_password_not_already_used_help_text_min(self):
+        v = PasswordNotAlreadyUsedValidator(min_unique_passwords=10)
+        self.assertEqual(
+            v.get_help_text(),
+            "Your password must be different than the last 10 passwords."
+        )
+
+    def test_password_not_already_used_min_unique_passwords(self):
+        for i in range(3):
+            self.ui_user.set_password(get_random_string(12))
+            self.ui_user.save()
+            self.ui_user.refresh_from_db()
+        v = PasswordNotAlreadyUsedValidator(min_unique_passwords=3)
+        self.assertIsNone(v.validate(self.ui_user_pwd))
+        self.assertIsNone(v.validate(self.ui_user_pwd, self.ui_user))
+        v = PasswordNotAlreadyUsedValidator(min_unique_passwords=4)
+        with self.assertRaises(ValidationError) as cm:
+            v.validate(self.ui_user_pwd, self.ui_user)
+        self.assertEqual(
+            cm.exception.args,
+            ('You have already used that password, try another.',
+             'password_already_used',
+             {'min_unique_passwords': 4})
+        )
+        v = PasswordNotAlreadyUsedValidator()
+        with self.assertRaises(ValidationError) as cm:
+            v.validate(self.ui_user_pwd, self.ui_user)
+        self.assertEqual(
+            cm.exception.args,
+            ('You have already used that password, try another.',
+             'password_already_used',
+             {'min_unique_passwords': None})
+        )

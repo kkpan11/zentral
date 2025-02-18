@@ -132,7 +132,9 @@ class MonolithAPIViewsTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [{
             'id': repository.pk,
+            'provisioning_uid': None,
             'backend': 'VIRTUAL',
+            'azure_kwargs': None,
             's3_kwargs': None,
             'name': repository.name,
             'created_at': repository.created_at.isoformat(),
@@ -150,8 +152,29 @@ class MonolithAPIViewsTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [{
             'id': repository.pk,
+            'provisioning_uid': None,
             'backend': 'S3',
+            'azure_kwargs': None,
             's3_kwargs': repository.get_backend_kwargs(),
+            'name': repository.name,
+            'created_at': repository.created_at.isoformat(),
+            'updated_at': repository.updated_at.isoformat(),
+            'meta_business_unit': self.mbu.pk,
+            'client_resources': [],
+            'icon_hashes': {},
+            'last_synced_at': None,
+        }])
+
+    def test_get_provisioned_repositories(self):
+        self._set_permissions("monolith.view_repository")
+        provisioning_uid = get_random_string(12)
+        repository = force_repository(mbu=self.mbu, provisioning_uid=provisioning_uid)
+        response = self.get(reverse("monolith_api:repositories"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [{
+            'id': repository.pk,
+            'provisioning_uid': provisioning_uid,
+            # no backend, azure_kwargs and s3_kwargs
             'name': repository.name,
             'created_at': repository.created_at.isoformat(),
             'updated_at': repository.updated_at.isoformat(),
@@ -272,7 +295,9 @@ class MonolithAPIViewsTestCase(TestCase):
         repository = Repository.objects.get(name=name)
         self.assertEqual(response.json(), {
             'id': repository.pk,
+            'provisioning_uid': None,
             'backend': 'S3',
+            'azure_kwargs': None,
             's3_kwargs': {"bucket": bucket},
             'name': repository.name,
             'created_at': repository.created_at.isoformat(),
@@ -312,6 +337,85 @@ class MonolithAPIViewsTestCase(TestCase):
         self.assertEqual(repository_backend.signature_version, "s3v4")
         self.assertIsNone(repository_backend.cloudfront_signer)
 
+    def test_create_azure_repository_missing_info(self):
+        self._set_permissions("monolith.add_repository")
+        response = self._post_json_data(
+            reverse("monolith_api:repositories"),
+            {"name": get_random_string(12),
+             "meta_business_unit": self.mbu.pk,
+             "backend": "AZURE",
+             "azure_kwargs": {}},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {'azure_kwargs': {'storage_account': ['This field is required.'],
+                                                            'container': ['This field is required.']}})
+
+    @patch("base.notifier.Notifier.send_notification")
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_create_azure_repository(self, post_event, send_notification):
+        self._set_permissions("monolith.add_repository")
+        name = get_random_string(12)
+        storage_account = get_random_string(12)
+        container = get_random_string(12)
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self._post_json_data(
+                reverse("monolith_api:repositories"),
+                {"name": name,
+                 "meta_business_unit": self.mbu.pk,
+                 "backend": "AZURE",
+                 "azure_kwargs": {"storage_account": storage_account,
+                                  "container": container,
+                                  "client_id": "",
+                                  "tenant_id": "",
+                                  "client_secret": "",
+                                  }},
+            )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(callbacks), 1)
+        repository = Repository.objects.get(name=name)
+        self.assertEqual(response.json(), {
+            'id': repository.pk,
+            'provisioning_uid': None,
+            'backend': 'AZURE',
+            'azure_kwargs': {"storage_account": storage_account,
+                             "container": container},
+            's3_kwargs': None,
+            'name': repository.name,
+            'created_at': repository.created_at.isoformat(),
+            'updated_at': repository.updated_at.isoformat(),
+            'meta_business_unit': self.mbu.pk,
+            'client_resources': [],
+            'icon_hashes': {},
+            'last_synced_at': None,
+        })
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "created",
+             "object": {
+                 "model": "monolith.repository",
+                 "pk": str(repository.pk),
+                 "new_value": {
+                     "pk": repository.pk,
+                     "name": name,
+                     "meta_business_unit": {"pk": self.mbu.pk, "name": self.mbu.name},
+                     "backend": "AZURE",
+                     "backend_kwargs": {"storage_account": storage_account,
+                                        "container": container},
+                     "created_at": repository.created_at,
+                     "updated_at": repository.updated_at,
+                 }
+              }}
+        )
+        metadata = event.metadata.serialize()
+        self.assertEqual(metadata["objects"], {"monolith_repository": [str(repository.pk)]})
+        self.assertEqual(sorted(metadata["tags"]), ["monolith", "zentral"])
+        send_notification.assert_called_once_with("monolith.repository", str(repository.pk))
+        repository_backend = load_repository_backend(repository)
+        self.assertEqual(repository_backend.prefix, "")
+        self.assertEqual(repository_backend._credential_kwargs, {})
+
     @patch("base.notifier.Notifier.send_notification")
     @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
     def test_create_virtual_repository(self, post_event, send_notification):
@@ -328,7 +432,9 @@ class MonolithAPIViewsTestCase(TestCase):
         repository = Repository.objects.get(name=name)
         self.assertEqual(response.json(), {
             'id': repository.pk,
+            'provisioning_uid': None,
             'backend': 'VIRTUAL',
+            'azure_kwargs': None,
             's3_kwargs': None,
             'name': repository.name,
             'created_at': repository.created_at.isoformat(),
@@ -361,6 +467,23 @@ class MonolithAPIViewsTestCase(TestCase):
         self.assertEqual(sorted(metadata["tags"]), ["monolith", "zentral"])
         send_notification.assert_called_once_with("monolith.repository", str(repository.pk))
 
+    def test_create_s3_repository_provisining_id_read_only(self):
+        self._set_permissions("monolith.add_repository")
+        name = get_random_string(12)
+        provisioning_uid = get_random_string(12)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self._post_json_data(
+                reverse("monolith_api:repositories"),
+                {"name": name,
+                 "provisioning_uid": provisioning_uid,
+                 "backend": "S3",
+                 "s3_kwargs": {"bucket": get_random_string(12)}},
+            )
+        self.assertEqual(response.status_code, 201)
+        repository = Repository.objects.get(pk=response.json()["id"])
+        self.assertEqual(repository.name, name)
+        self.assertIsNone(repository.provisioning_uid)
+
     # get repository
 
     def test_get_repository_unauthorized(self):
@@ -380,7 +503,9 @@ class MonolithAPIViewsTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {
             'id': repository.pk,
+            'provisioning_uid': None,
             'backend': 'S3',
+            'azure_kwargs': None,
             's3_kwargs': repository.get_backend_kwargs(),
             'name': repository.name,
             'created_at': repository.created_at.isoformat(),
@@ -403,6 +528,18 @@ class MonolithAPIViewsTestCase(TestCase):
         repository = force_repository()
         response = self._post_json_data(reverse("monolith_api:repository", args=(repository.pk,)), {})
         self.assertEqual(response.status_code, 403)
+
+    def test_update_provisioned_repository_cannot_be_updated(self):
+        repository = force_repository(provisioning_uid=get_random_string(12))
+        self._set_permissions("monolith.change_repository")
+        response = self._put_json_data(
+            reverse("monolith_api:repository", args=(repository.pk,)),
+            {"name": "yolo",
+             "backend": "S3",
+             "s3_kwargs": {"bucket": "fomo"}}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), ['This repository cannot be updated'])
 
     def test_update_s3_repository_bad_mbu(self):
         repository = force_repository()
@@ -466,7 +603,9 @@ class MonolithAPIViewsTestCase(TestCase):
         repository.refresh_from_db()
         self.assertEqual(response.json(), {
             'id': repository.pk,
+            'provisioning_uid': None,
             'backend': 'S3',
+            'azure_kwargs': None,
             's3_kwargs': {
                 "bucket": new_bucket,
                 "region_name": "us-east2",
@@ -547,6 +686,25 @@ class MonolithAPIViewsTestCase(TestCase):
         manifest.refresh_from_db()
         self.assertEqual(manifest.version, 2)  # only one bump
 
+    def test_update_s3_repository_provisioning_id_read_only(self):
+        repository = force_repository()
+        self._set_permissions("monolith.change_repository")
+        new_name = get_random_string(12)
+        new_bucket = get_random_string(12)
+        response = self._put_json_data(
+            reverse("monolith_api:repository", args=(repository.pk,)),
+            {"name": new_name,
+             "provisioning_uid": get_random_string(12),
+             "backend": "S3",
+             "s3_kwargs": {"bucket": new_bucket}},
+        )
+        self.assertEqual(response.status_code, 200)
+        repository2 = Repository.objects.get(pk=response.json()["id"])
+        self.assertEqual(repository2, repository)
+        self.assertEqual(repository2.name, new_name)
+        self.assertEqual(repository2.get_backend_kwargs(), {"bucket": new_bucket})
+        self.assertIsNone(repository2.provisioning_uid)
+
     # delete repository
 
     def test_delete_repository_unauthorized(self):
@@ -559,10 +717,17 @@ class MonolithAPIViewsTestCase(TestCase):
         response = self.delete(reverse("monolith_api:repository", args=(repository.pk,)))
         self.assertEqual(response.status_code, 403)
 
-    def test_delete_repository_cannot_be_deleted(self):
+    def test_delete_linked_repository_cannot_be_deleted(self):
         repository = force_repository()
         manifest = force_manifest()
         force_catalog(repository=repository, manifest=manifest)
+        self._set_permissions("monolith.delete_repository")
+        response = self.delete(reverse("monolith_api:repository", args=(repository.pk,)))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), ['This repository cannot be deleted'])
+
+    def test_delete_provisioned_repository_cannot_be_deleted(self):
+        repository = force_repository(provisioning_uid=get_random_string(12))
         self._set_permissions("monolith.delete_repository")
         response = self.delete(reverse("monolith_api:repository", args=(repository.pk,)))
         self.assertEqual(response.status_code, 400)

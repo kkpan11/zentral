@@ -1,32 +1,27 @@
-import copy
-import base64
-import hashlib
 import logging
-import plistlib
-import random
 from django.conf import settings
 from django.contrib.auth import authenticate, login
 from django.urls import reverse
 from accounts.events import post_group_membership_updates
 from .middlewares import SESSION_KEY
+from .models import RealmGroupMapping
 
 
 logger = logging.getLogger("zentral.realms.utils")
 
 
-try:
-    random = random.SystemRandom()
-except NotImplementedError:
-    logger.warning('No secure pseudo random number generator available.')
-
-
-def get_realm_user_mapped_groups(realm_user):
-    mapped_groups = set([])
+def get_realm_user_mapped_realm_groups(realm_user):
+    mapped_realm_groups = None
     claims = realm_user.claims
     if "ava" in claims:
         # special case for SAML
         claims = claims["ava"]
-    for realm_group_mapping in realm_user.realm.realmgroupmapping_set.select_related("group").all():
+    for realm_group_mapping in (
+        RealmGroupMapping.objects.select_related("realm_group")
+                                 .filter(realm_group__realm=realm_user.realm)
+    ):
+        if mapped_realm_groups is None:
+            mapped_realm_groups = set()
         claim_values = claims.get(realm_group_mapping.claim)
         if not isinstance(claim_values, list):
             claim_values = [claim_values]
@@ -38,12 +33,29 @@ def get_realm_user_mapped_groups(realm_user):
             else:
                 values = [claim_value]
             if realm_group_mapping.value in values:
-                mapped_groups.add(realm_group_mapping.group)
+                mapped_realm_groups.add(realm_group_mapping.realm_group)
                 break
+    return mapped_realm_groups
+
+
+def apply_realm_group_mappings(realm_user):
+    mapped_realm_groups = get_realm_user_mapped_realm_groups(realm_user)
+    if mapped_realm_groups is None:
+        return
+    current_realm_groups = set(realm_user.groups.all())
+    if current_realm_groups != mapped_realm_groups:
+        realm_user.groups.set(mapped_realm_groups)
+
+
+def get_realm_user_mapped_groups(realm_user):
+    mapped_groups = set()
+    for realm_group, _ in realm_user.groups_with_types():
+        for role_mapping in realm_group.rolemapping_set.select_related("group").all():
+            mapped_groups.add(role_mapping.group)
     return mapped_groups
 
 
-def _update_remote_user_groups(request, realm_user):
+def apply_role_mappings(request, realm_user):
     user = request.user
     if not user.is_remote:
         return
@@ -71,8 +83,8 @@ def login_callback(request, realm_authentication_session, next_url=None):
     login(request, user)
     request.session.set_expiry(realm_authentication_session.computed_expiry())
 
-    # apply realm group mappings
-    _update_remote_user_groups(request, realm_user)
+    # update the Zentral user groups (roles)
+    apply_role_mappings(request, realm_user)
 
     return next_url or settings.LOGIN_REDIRECT_URL
 
@@ -84,33 +96,3 @@ def test_callback(request, realm_authentication_session):
     return reverse("realms:authentication_session",
                    args=(realm_authentication_session.realm.pk,
                          realm_authentication_session.pk))
-
-
-def build_password_hash_dict(password, iterations=39999, salt=None):
-    # see https://developer.apple.com/documentation/devicemanagement/setautoadminpasswordcommand/command
-    # for the compatibility
-    password = password.encode("utf-8")
-    if salt is None:
-        salt = bytearray(random.getrandbits(8) for i in range(32))
-    # see https://github.com/micromdm/micromdm/blob/master/pkg/crypto/password/password.go macKeyLen !!!
-    # Danke github.com/groob !!!
-    dklen = 128
-
-    dk = hashlib.pbkdf2_hmac("sha512", password, salt, iterations, dklen=dklen)
-    return {
-        "SALTED-SHA512-PBKDF2": {
-            "entropy": base64.b64encode(dk).decode("ascii").strip(),
-            "salt": base64.b64encode(salt).decode("ascii").strip(),
-            "iterations": iterations
-        }
-    }
-
-
-def serialize_password_hash_dict(password_hash_dict):
-    password_hash_dict = copy.deepcopy(password_hash_dict)
-    for hash_type, hash_dict in password_hash_dict.items():
-        for k, v in hash_dict.items():
-            if isinstance(v, str):
-                # decode base64 encoded bytes
-                hash_dict[k] = base64.b64decode(v.encode("utf-8"))  # → bytes to get <data/> in the plist
-    return plistlib.dumps(password_hash_dict).strip()

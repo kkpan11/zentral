@@ -9,7 +9,7 @@ from django.utils.crypto import get_random_string
 from zentral.contrib.inventory.models import MetaBusinessUnit
 from zentral.contrib.mdm.artifacts import Target
 from zentral.contrib.mdm.commands import SetupFileVault
-from zentral.contrib.mdm.commands.scheduling import _setup_filevault
+from zentral.contrib.mdm.commands.scheduling import _get_next_queued_command, _setup_filevault
 from zentral.contrib.mdm.models import Channel, Command, Platform, RequestStatus
 from .utils import force_blueprint, force_dep_enrollment_session, force_filevault_config
 
@@ -218,7 +218,7 @@ class SetupFileVaultCommandTestCase(TestCase):
             if sub_payload_type == "com.apple.MCX.FileVault2":
                 self.assertTrue(sub_payload["ForceEnableInSetupAssistant"])
                 self.assertEqual(sub_payload["ShowRecoveryKey"], filevault_config.show_recovery_key)
-                self.assertNotIn("Defer", sub_payload)
+                self.assertTrue(sub_payload["Defer"])  # macOS 14.4 workaround
                 self.assertNotIn("DeferDontAskAtUserLogout", sub_payload)
                 self.assertNotIn("DeferForceAtUserLoginMaxBypassAttempts", sub_payload)
                 self.assertEqual(sub_payload["PayloadIdentifier"], "com.zentral.mdm.fv.configuration")
@@ -374,3 +374,25 @@ class SetupFileVaultCommandTestCase(TestCase):
             RequestStatus.IDLE,
         )
         self.assertIsInstance(cmd, SetupFileVault)
+
+    def test_setup_filevault_reschedule_not_now(self):
+        self.enrolled_device.user_approved_enrollment = True
+        self.enrolled_device.user_enrollment = False
+        self.assertFalse(self.enrolled_device.awaiting_configuration)
+        filevault_config = force_filevault_config()
+        self.enrolled_device.blueprint = force_blueprint(filevault_config=filevault_config)
+        target = Target(self.enrolled_device)
+        cmd = SetupFileVault.create_for_target(target)
+        cmd.process_response(
+            {"UDID": self.enrolled_device.udid,
+             "Status": "NotNow",
+             "CommandUUID": str(cmd.uuid).upper()},
+            self.dep_enrollment_session,
+            self.mbu
+        )
+        cmd2 = _get_next_queued_command(
+            target,
+            self.dep_enrollment_session,
+            RequestStatus.IDLE,
+        )
+        self.assertEqual(cmd2, cmd)

@@ -53,7 +53,7 @@ class InstallProfile(Command):
                 or enrolled_device.platform in (Platform.IPADOS, Platform.MACOS)
             ) and (
                 not enrolled_device.user_enrollment
-                or enrolled_device.platform in (Platform.IOS, Platform.MACOS)
+                or enrolled_device.platform in (Platform.IOS, Platform.IPADOS, Platform.MACOS)
             )
         )
 
@@ -64,7 +64,7 @@ class InstallProfile(Command):
         self.target.update_target_artifact(
             self.artifact_version,
             TargetArtifact.Status.ACKNOWLEDGED,
-            allow_reinstall=True
+            unique_install_identifier=self.uuid,
         )
 
     def command_error(self):

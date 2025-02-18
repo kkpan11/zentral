@@ -9,6 +9,7 @@ from django.test import TestCase
 from django.utils.crypto import get_random_string
 from zentral.contrib.inventory.models import MachineTag, MetaBusinessUnit, Tag
 from zentral.contrib.mdm.artifacts import Target, update_blueprint_serialized_artifacts
+from zentral.contrib.mdm.declarations import get_artifact_version_server_token
 from zentral.contrib.mdm.models import (Asset, Artifact, ArtifactVersion, ArtifactVersionTag,
                                         Blueprint, BlueprintArtifact,
                                         Channel, DeviceArtifact,
@@ -17,7 +18,8 @@ from zentral.contrib.mdm.models import (Asset, Artifact, ArtifactVersion, Artifa
                                         Platform, Profile, PushCertificate,
                                         StoreApp, TargetArtifact,
                                         UserArtifact)
-from .utils import (force_software_update, force_software_update_enforcement,
+from .utils import (force_artifact, force_blueprint_artifact,
+                    force_software_update, force_software_update_enforcement,
                     MACOS_13_CLIENT_CAPABILITIES, MACOS_14_CLIENT_CAPABILITIES)
 
 
@@ -59,6 +61,8 @@ def build_profile(
 
 
 class TestMDMArtifacts(TestCase):
+    maxDiff = None
+
     @classmethod
     def setUpTestData(cls):
         cls.meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(32))
@@ -244,13 +248,18 @@ class TestMDMArtifacts(TestCase):
         )
         configurations = status_report["StatusItems"]["management"]["declarations"]["configurations"]
         configurations.pop()
-        for artifact_version, valid, active in extra_configurations:
-            configurations.append({
-                "valid": "valid" if valid else "invalid",
+        for artifact_version, valid, active, reasons in extra_configurations:
+            if isinstance(valid, bool):
+                valid = "valid" if valid else "invalid"
+            configuration = {
+                "valid": valid,
                 "active": active,
                 "identifier": f"zentral.legacy-profile.{artifact_version.artifact.pk}",
                 "server-token": str(artifact_version.pk),
-            })
+            }
+            if reasons:
+                configuration["reasons"] = reasons
+            configurations.append(configuration)
         return status_report
 
     # default platforms
@@ -838,6 +847,47 @@ class TestMDMArtifacts(TestCase):
         self.assertIn(f"zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions", scs)
         self.assertIn(f"zentral.blueprint.{self.blueprint1.pk}.softwareupdate-enforcement-specific", scs)
 
+    def test_device_activation_manual_config_not_included(self):
+        artifact, _ = force_artifact(artifact_type=Artifact.Type.MANUAL_CONFIGURATION)
+        force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.ACTIVATION,
+            decl_type="com.apple.activation.simple",
+            decl_payload={
+                "StandardConfigurations": [f"ztl:{artifact.pk}"],
+            }
+        )
+        target = Target(self.enrolled_device)
+        activation = target.activation
+        activation.pop("ServerToken")
+        self.assertEqual(
+            activation,
+            {'Identifier': f'zentral.blueprint.{self.blueprint1.pk}.activation',
+             'Payload': {'StandardConfigurations': [
+                             f'zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions']},
+             'Type': 'com.apple.activation.simple'}
+        )
+
+    def test_device_activation_config_included(self):
+        _, artifact, _ = force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.CONFIGURATION,
+        )
+        target = Target(self.enrolled_device)
+        activation = target.activation
+        activation.pop("ServerToken")
+        self.assertEqual(
+            activation,
+            {'Identifier': f'zentral.blueprint.{self.blueprint1.pk}.activation',
+             'Payload': {'StandardConfigurations': [
+                             f'zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions',
+                             f'zentral.declaration.{artifact.pk}',
+                          ]},
+             'Type': 'com.apple.activation.simple'}
+        )
+
+    # declaration items
+
     def test_user_declaration_items_enterprise_app_not_included(self):
         _, profile_a, (profile_av,) = self._force_blueprint_artifact(channel=Channel.USER)
         profile_a.reinstall_on_os_update = Artifact.ReinstallOnOSUpdate.PATCH
@@ -846,6 +896,8 @@ class TestMDMArtifacts(TestCase):
         self._force_blueprint_artifact(artifact_type=Artifact.Type.ENTERPRISE_APP, channel=Channel.USER)
         self.enrolled_device.os_version = "13.1.0"
         target = Target(self.enrolled_device, self.enrolled_user)
+        for i in range(3):
+            target.update_target_artifact(profile_av, TargetArtifact.Status.FAILED)  # force retry
         declaration_items = target.declaration_items
         self.assertEqual(sorted(declaration_items.keys()), ["Declarations", "DeclarationsToken"])
         declarations = declaration_items["Declarations"]
@@ -863,7 +915,7 @@ class TestMDMArtifacts(TestCase):
                          f"zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions")
         self.assertEqual(configurations[0]["ServerToken"], "0ed215547af3061ce18ea6cf7a69dac4a3d52f3f")
         self.assertEqual(configurations[1]["Identifier"], f"zentral.legacy-profile.{profile_a.pk}")
-        self.assertEqual(configurations[1]["ServerToken"], f"{profile_av.pk}.ov-13.1.0.ri-0")
+        self.assertEqual(configurations[1]["ServerToken"], f"{profile_av.pk}.ov-13.1.0.ri-0.rc-2")  # max rc = 2
 
     def test_device_declaration_items_required_profile_included(self):
         profile_a, (profile_av,) = self._force_artifact(
@@ -920,6 +972,49 @@ class TestMDMArtifacts(TestCase):
                          f"zentral.blueprint.{self.blueprint1.pk}.softwareupdate-enforcement-specific")
         self.assertEqual(configurations[1]["ServerToken"], "724edaf760e7d7282084dcf3eaef6467447accd1")
 
+    def test_device_declaration_items_config_and_dep_included(self):
+        artifact, (artifact_version,) = force_artifact(artifact_type=Artifact.Type.DATA_ASSET)
+        _, parent_artifact, _ = force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.CONFIGURATION,
+            decl_type="com.apple.configuration.services.configuration-files",
+            decl_payload={
+                "ServiceType": "com.apple.sudo",
+                "DataAssetReference": f"ztl:{artifact.pk}",
+            },
+        )
+        target = Target(self.enrolled_device)
+        declarations = target.declaration_items["Declarations"]
+        self.assertEqual(set(d['Identifier'] for d in declarations["Activations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.activation"})
+        self.assertEqual(set(d['Identifier'] for d in declarations["Assets"]),
+                         {f"zentral.data-asset.{artifact.pk}"})
+        self.assertEqual(set(d['Identifier'] for d in declarations["Configurations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions",
+                          f"zentral.declaration.{parent_artifact.pk}"})
+        self.assertEqual(len(declarations["Management"]), 0)
+
+    def test_device_declaration_items_activation_and_dep_included(self):
+        artifact, _ = force_artifact(artifact_type=Artifact.Type.MANUAL_CONFIGURATION)
+        _, parent_artifact, _ = force_blueprint_artifact(
+            blueprint=self.blueprint1,
+            artifact_type=Artifact.Type.ACTIVATION,
+            decl_type="com.apple.activation.simple",
+            decl_payload={
+                "StandardConfigurations": [f"ztl:{artifact.pk}"],
+            }
+        )
+        target = Target(self.enrolled_device)
+        declarations = target.declaration_items["Declarations"]
+        self.assertEqual(set(d['Identifier'] for d in declarations["Activations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.activation",
+                          f"zentral.declaration.{parent_artifact.pk}"})
+        self.assertEqual(len(declarations["Assets"]), 0)
+        self.assertEqual(set(d['Identifier'] for d in declarations["Configurations"]),
+                         {f"zentral.blueprint.{self.blueprint1.pk}.management-status-subscriptions",
+                          f"zentral.declaration.{artifact.pk}"})
+        self.assertEqual(len(declarations["Management"]), 0)
+
     # update_target_artifact
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
@@ -941,36 +1036,17 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(da.status, TargetArtifact.Status.INSTALLED)
         self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
         self.assertIsNone(da.os_version_at_install_time)
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
         target.update_target_artifact(profile_av, TargetArtifact.Status.INSTALLED)
         self.assertEqual(da_qs.count(), 1)
         da.refresh_from_db()
         # no reinstall
         self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
-
-    @patch("zentral.contrib.mdm.artifacts.datetime")
-    def test_update_target_artifact_allow_reinstall(self, patched_datetime):
-        patched_datetime.utcnow.side_effect = (
-            datetime(2001, 2, 3, 4, 5, 6),
-            datetime(2002, 3, 4, 5, 6, 7),
-        )
-        _, profile_a, (profile_av,) = self._force_blueprint_artifact()
-        target = Target(self.enrolled_device)
-        target.update_target_artifact(profile_av, TargetArtifact.Status.INSTALLED)
-        da_qs = DeviceArtifact.objects.filter(
-            enrolled_device=self.enrolled_device,
-            artifact_version__artifact=profile_a,
-        )
-        self.assertEqual(da_qs.count(), 1)
-        da = da_qs.first()
-        self.assertEqual(da.artifact_version, profile_av)
-        self.assertEqual(da.status, TargetArtifact.Status.INSTALLED)
-        self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
-        self.assertIsNone(da.os_version_at_install_time)
-        target.update_target_artifact(profile_av, TargetArtifact.Status.INSTALLED, allow_reinstall=True)
-        self.assertEqual(da_qs.count(), 1)
-        da.refresh_from_db()
-        # reinstall
-        self.assertEqual(da.installed_at, datetime(2002, 3, 4, 5, 6, 7))
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifact_same_uii_no_reinstall(self, patched_datetime):
@@ -995,6 +1071,9 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(da.status, TargetArtifact.Status.INSTALLED)
         self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
         self.assertIsNone(da.os_version_at_install_time)
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
         target.update_target_artifact(
             profile_av,
             TargetArtifact.Status.INSTALLED,
@@ -1004,6 +1083,9 @@ class TestMDMArtifacts(TestCase):
         da.refresh_from_db()
         # no reinstall
         self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifact_uii_diff_reinstall(self, patched_datetime):
@@ -1030,6 +1112,9 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
         self.assertEqual(da.os_version_at_install_time, "13.3.1")
         self.assertEqual(da.unique_install_identifier, str(profile_av.pk))
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
         self.enrolled_device.os_version = "13.4.0"
         target = Target(self.enrolled_device)
         target.update_target_artifact(
@@ -1045,6 +1130,9 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(da.installed_at, datetime(2002, 3, 4, 5, 6, 7))
         self.assertEqual(da.os_version_at_install_time, "13.4.0")
         self.assertEqual(da.unique_install_identifier, str(profile_av.pk) + "diff")
+        self.assertEqual(da.install_count, 2)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifact_failed_reinstall_reset(self, patched_datetime):
@@ -1070,6 +1158,9 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(da.status, TargetArtifact.Status.INSTALLED)
         self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
         self.assertEqual(da.os_version_at_install_time, "13.3.1")
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
         self.enrolled_device.os_version = "13.4.0"
         target = Target(self.enrolled_device)  # avoid os version cache
         target.update_target_artifact(
@@ -1084,6 +1175,9 @@ class TestMDMArtifacts(TestCase):
         self.assertIsNone(da.installed_at)
         self.assertIsNone(da.os_version_at_install_time)
         self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 1)
+        self.assertEqual(da.max_retry_count, 2)
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifact_install_over_failed_update(self, patched_datetime):
@@ -1110,6 +1204,9 @@ class TestMDMArtifacts(TestCase):
         self.assertIsNone(da.installed_at)
         self.assertIsNone(da.os_version_at_install_time)
         self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 0)
+        self.assertEqual(da.retry_count, 1)
+        self.assertEqual(da.max_retry_count, 2)
         self.enrolled_device.os_version = "13.4.0"
         target = Target(self.enrolled_device)  # avoid os version cache
         target.update_target_artifact(
@@ -1121,9 +1218,12 @@ class TestMDMArtifacts(TestCase):
         da.refresh_from_db()
         # update
         self.assertEqual(da.status, TargetArtifact.Status.INSTALLED)
-        self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
+        self.assertEqual(da.installed_at, datetime(2002, 3, 4, 5, 6, 7))
         self.assertEqual(da.os_version_at_install_time, "13.4.0")
         self.assertEqual(da.unique_install_identifier, str(profile_av.pk))
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 1)
+        self.assertEqual(da.max_retry_count, 3)
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifact_upgrade_update(self, patched_datetime):
@@ -1149,6 +1249,9 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(da.installed_at, datetime(2001, 2, 3, 4, 5, 6))
         self.assertEqual(da.os_version_at_install_time, "13.3.1")
         self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 1)
+        self.assertEqual(da.retry_count, 0)
+        self.assertEqual(da.max_retry_count, 2)
         self.enrolled_device.os_version = "13.4.0"
         target = Target(self.enrolled_device)  # avoid os version cache
         target.update_target_artifact(
@@ -1163,6 +1266,95 @@ class TestMDMArtifacts(TestCase):
         self.assertEqual(da2.installed_at, datetime(2002, 3, 4, 5, 6, 7))
         self.assertEqual(da2.os_version_at_install_time, "13.4.0")
         self.assertEqual(da2.unique_install_identifier, "")
+        self.assertEqual(da2.install_count, 1)
+        self.assertEqual(da2.retry_count, 0)
+        self.assertEqual(da2.max_retry_count, 2)
+
+    @patch("zentral.contrib.mdm.artifacts.datetime")
+    def test_update_target_artifact_max_retry_count(self, patched_datetime):
+        patched_datetime.utcnow.side_effect = (
+            datetime(2001, 2, 3, 4, 5, 6),
+            datetime(2002, 3, 4, 5, 6, 7),
+            datetime(2003, 4, 5, 6, 7, 8),
+        )
+        _, profile_a, (profile_av,) = self._force_blueprint_artifact()
+        target = Target(self.enrolled_device)
+        # first failed install
+        uiid = get_artifact_version_server_token(
+            target,
+            {"reinstall_on_os_update": Artifact.ReinstallOnOSUpdate.NO,
+             "reinstall_interval": 0},
+            {"pk": str(profile_av.pk)},
+            0,
+        )
+        self.assertEqual(uiid, str(profile_av.pk))
+        target.update_target_artifact(
+            profile_av,
+            TargetArtifact.Status.FAILED,
+            unique_install_identifier=uiid,
+        )
+        da_qs = DeviceArtifact.objects.filter(
+            enrolled_device=self.enrolled_device,
+            artifact_version__artifact=profile_a,
+        )
+        self.assertEqual(da_qs.count(), 1)
+        da = da_qs.first()
+        self.assertEqual(da.artifact_version, profile_av)
+        self.assertEqual(da.status, TargetArtifact.Status.FAILED)
+        self.assertIsNone(da.installed_at)
+        self.assertIsNone(da.os_version_at_install_time)
+        self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 0)
+        self.assertEqual(da.retry_count, 1)
+        self.assertEqual(da.max_retry_count, 2)
+        # second failed install
+        uiid = get_artifact_version_server_token(
+            target,
+            {"reinstall_on_os_update": Artifact.ReinstallOnOSUpdate.NO,
+             "reinstall_interval": 0},
+            {"pk": str(profile_av.pk)},
+            da.retry_count,
+        )
+        self.assertEqual(uiid, f"{profile_av.pk}.rc-1")
+        target.update_target_artifact(
+            profile_av,
+            TargetArtifact.Status.FAILED,
+            unique_install_identifier=uiid
+        )
+        self.assertEqual(da_qs.count(), 1)
+        da.refresh_from_db()
+        self.assertEqual(da.artifact_version, profile_av)
+        self.assertEqual(da.status, TargetArtifact.Status.FAILED)
+        self.assertIsNone(da.installed_at)
+        self.assertIsNone(da.os_version_at_install_time)
+        self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 0)
+        self.assertEqual(da.retry_count, 2)
+        self.assertEqual(da.max_retry_count, 2)
+        # third failed install
+        uiid = get_artifact_version_server_token(
+            target,
+            {"reinstall_on_os_update": Artifact.ReinstallOnOSUpdate.NO,
+             "reinstall_interval": 0},
+            {"pk": str(profile_av.pk)},
+            da.retry_count,
+        )
+        self.assertEqual(uiid, f"{profile_av.pk}.rc-2")
+        target.update_target_artifact(
+            profile_av,
+            TargetArtifact.Status.FAILED,
+            unique_install_identifier=uiid,
+        )
+        self.assertEqual(da_qs.count(), 1)
+        da.refresh_from_db()
+        self.assertEqual(da.artifact_version, profile_av)
+        self.assertEqual(da.status, TargetArtifact.Status.FAILED)
+        self.assertIsNone(da.installed_at)
+        self.assertIsNone(da.os_version_at_install_time)
+        self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 0)
+        self.assertEqual(da.retry_count, 2)  # not 3!
+        self.assertEqual(da.max_retry_count, 2)
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifact_upgrade_over_failed_install(self, patched_datetime):
@@ -1189,6 +1381,9 @@ class TestMDMArtifacts(TestCase):
         self.assertIsNone(da.installed_at)
         self.assertIsNone(da.os_version_at_install_time)
         self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 0)
+        self.assertEqual(da.retry_count, 1)
+        self.assertEqual(da.max_retry_count, 2)
         self.enrolled_device.os_version = "13.4.0"
         target = Target(self.enrolled_device)  # avoid os version cache
         target.update_target_artifact(
@@ -1201,9 +1396,12 @@ class TestMDMArtifacts(TestCase):
         self.assertNotEqual(da2, da)
         self.assertEqual(da2.artifact_version, profile_av2)
         self.assertEqual(da2.status, TargetArtifact.Status.INSTALLED)
-        self.assertEqual(da2.installed_at, datetime(2001, 2, 3, 4, 5, 6))
+        self.assertEqual(da2.installed_at, datetime(2002, 3, 4, 5, 6, 7))
         self.assertEqual(da2.os_version_at_install_time, "13.4.0")
         self.assertEqual(da2.unique_install_identifier, str(profile_av2.pk))
+        self.assertEqual(da2.install_count, 1)
+        self.assertEqual(da2.retry_count, 0)
+        self.assertEqual(da2.max_retry_count, 2)
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifact_failed_upgrade_over_failed_install(self, patched_datetime):
@@ -1230,6 +1428,9 @@ class TestMDMArtifacts(TestCase):
         self.assertIsNone(da.installed_at)
         self.assertIsNone(da.os_version_at_install_time)
         self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 0)
+        self.assertEqual(da.retry_count, 1)
+        self.assertEqual(da.max_retry_count, 2)
         self.enrolled_device.os_version = "13.4.0"
         target = Target(self.enrolled_device)  # avoid os version cache
         target.update_target_artifact(
@@ -1245,6 +1446,9 @@ class TestMDMArtifacts(TestCase):
         self.assertIsNone(da.installed_at)
         self.assertIsNone(da.os_version_at_install_time)
         self.assertEqual(da.unique_install_identifier, "")
+        self.assertEqual(da.install_count, 0)
+        self.assertEqual(da.retry_count, 1)
+        self.assertEqual(da.max_retry_count, 2)
         # new da
         da2 = da_qs[1]
         self.assertNotEqual(da2, da)
@@ -1253,49 +1457,202 @@ class TestMDMArtifacts(TestCase):
         self.assertIsNone(da2.installed_at)
         self.assertIsNone(da2.os_version_at_install_time)
         self.assertEqual(da2.unique_install_identifier, "")
+        self.assertEqual(da2.install_count, 0)
+        self.assertEqual(da2.retry_count, 1)
+        self.assertEqual(da2.max_retry_count, 2)
 
     # update_target_artifacts_from_status_report
 
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
     @patch("zentral.contrib.mdm.artifacts.datetime")
-    def test_update_target_artifacts_from_status_report_installed(self, patched_datetime):
-        patched_datetime.utcnow.return_value = datetime(2001, 2, 3, 4, 5, 6)
-        _, profile_a, (profile_av,) = self._force_blueprint_artifact()
-        status_report = self._build_status_report([(profile_av, True, True)])
+    def test_update_target_artifacts_from_status_report_installed_updated(self, patched_datetime, post_event):
+        patched_datetime.utcnow.side_effect = [datetime(2001, 2, 3, 4, 5, 6),
+                                               datetime(2002, 3, 4, 5, 6, 7),
+                                               datetime(2003, 4, 5, 6, 7, 8),]
+        _, profile_a, (profile_av2, profile_av) = self._force_blueprint_artifact(version_count=2)
+        # v1
+        status_report = self._build_status_report([(profile_av, True, True, None)])
         self.enrolled_device.os_version = "10.5.2"
         target = Target(self.enrolled_device)
-        self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
+        self.assertEqual(len(callbacks), 1)
         serialized_av = target._serialized_target_artifacts[str(profile_a.pk)]["versions"][str(profile_av.pk)]
         self.assertEqual(
             serialized_av,
-            (TargetArtifact.Status.INSTALLED, datetime(2001, 2, 3, 4, 5, 6), (10, 5, 2))
+            (TargetArtifact.Status.INSTALLED, datetime(2001, 2, 3, 4, 5, 6), (10, 5, 2), 0)
+        )
+        self.assertEqual(len(post_event.call_args_list), 1)
+        event = post_event.call_args_list[0].args[0]
+        self.assertEqual(
+            event.payload,
+            {'channel': 'Device',
+             'result': 'created',
+             'target_artifact': {
+                 'artifact_version': {'artifact': {'name': profile_a.name,
+                                                   'pk': str(profile_a.pk),
+                                                   'type': 'Profile'},
+                                      'pk': str(profile_av.pk),
+                                      'version': 1},
+                 'created_at': datetime(2001, 2, 3, 4, 5, 6),
+                 'extra_info': {'active': True, 'valid': 'valid'},
+                 'install_count': 1,
+                 'installed_at': datetime(2001, 2, 3, 4, 5, 6),
+                 'max_retry_count': 2,
+                 'os_version_at_install_time': '10.5.2',
+                 'retry_count': 0,
+                 'status': 'Installed',
+                 'unique_install_identifier': str(profile_av.pk),
+                 'updated_at': datetime(2001, 2, 3, 4, 5, 6)
+             }}
+        )
+        metadata = event.metadata.serialize()
+        self.assertEqual(metadata["objects"], {"mdm_artifact": [str(profile_a.pk)],
+                                               "mdm_artifactversion": [str(profile_av.pk)]})
+        self.assertEqual(sorted(metadata["tags"]), ["mdm"])
+        # v2
+        status_report = self._build_status_report([(profile_av2, True, True, None)])
+        self.enrolled_device.os_version = "10.5.3"
+        target = Target(self.enrolled_device)
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
+        self.assertEqual(len(callbacks), 1)
+        serialized_av = target._serialized_target_artifacts[str(profile_a.pk)]["versions"][str(profile_av2.pk)]
+        self.assertEqual(
+            serialized_av,
+            (TargetArtifact.Status.INSTALLED, datetime(2002, 3, 4, 5, 6, 7), (10, 5, 3), 0)
+        )
+        self.assertEqual(len(post_event.call_args_list), 3)
+        created_event = post_event.call_args_list[1].args[0]
+        self.assertEqual(
+            created_event.payload,
+            {'channel': 'Device',
+             'result': 'created',
+             'target_artifact': {
+                 'artifact_version': {'artifact': {'name': profile_a.name,
+                                                   'pk': str(profile_a.pk),
+                                                   'type': 'Profile'},
+                                      'pk': str(profile_av2.pk),
+                                      'version': 2},
+                 'created_at': datetime(2002, 3, 4, 5, 6, 7),
+                 'extra_info': {'active': True, 'valid': 'valid'},
+                 'install_count': 1,
+                 'installed_at': datetime(2002, 3, 4, 5, 6, 7),
+                 'max_retry_count': 2,
+                 'os_version_at_install_time': '10.5.3',
+                 'retry_count': 0,
+                 'status': 'Installed',
+                 'unique_install_identifier': str(profile_av2.pk),
+                 'updated_at': datetime(2002, 3, 4, 5, 6, 7)
+             }}
+        )
+        metadata = created_event.metadata.serialize()
+        self.assertEqual(metadata["objects"], {"mdm_artifact": [str(profile_a.pk)],
+                                               "mdm_artifactversion": [str(profile_av2.pk)]})
+        self.assertEqual(sorted(metadata["tags"]), ["mdm"])
+        deleted_event = post_event.call_args_list[2].args[0]
+        self.assertEqual(
+            deleted_event.payload,
+            {'channel': 'Device',
+             'result': 'deleted',
+             'target_artifact': {
+                 'artifact_version': {'artifact': {'name': profile_a.name,
+                                                   'pk': str(profile_a.pk),
+                                                   'type': 'Profile'},
+                                      'pk': str(profile_av.pk),
+                                      'version': 1},
+                 'created_at': datetime(2001, 2, 3, 4, 5, 6),
+                 'extra_info': {'active': True, 'valid': 'valid'},
+                 'install_count': 1,
+                 'installed_at': datetime(2001, 2, 3, 4, 5, 6),
+                 'max_retry_count': 2,
+                 'os_version_at_install_time': '10.5.2',
+                 'retry_count': 0,
+                 'status': 'Installed',
+                 'unique_install_identifier': str(profile_av.pk),
+                 'updated_at': datetime(2001, 2, 3, 4, 5, 6)
+             }}
+        )
+        metadata = deleted_event.metadata.serialize()
+        self.assertEqual(metadata["objects"], {"mdm_artifact": [str(profile_a.pk)],
+                                               "mdm_artifactversion": [str(profile_av.pk)]})
+        self.assertEqual(sorted(metadata["tags"]), ["mdm"])
+        # v2 again
+        self.enrolled_device.os_version = "10.5.4"
+        target = Target(self.enrolled_device)
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is False)
+        self.assertEqual(len(callbacks), 0)
+        self.assertEqual(len(post_event.call_args_list), 3)
+        serialized_av = target._serialized_target_artifacts[str(profile_a.pk)]["versions"][str(profile_av2.pk)]
+        self.assertEqual(
+            serialized_av,
+            (TargetArtifact.Status.INSTALLED, datetime(2002, 3, 4, 5, 6, 7), (10, 5, 3), 0)
         )
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
     def test_update_target_artifacts_from_status_report_uninstalled(self, patched_datetime):
         patched_datetime.utcnow.return_value = datetime(2001, 2, 3, 4, 5, 6)
         _, profile_a, (profile_av,) = self._force_blueprint_artifact()
-        status_report = self._build_status_report([(profile_av, True, False)])
+        status_report = self._build_status_report([(profile_av, True, False, None)])
         self.enrolled_device.os_version = "10.5.2"
         target = Target(self.enrolled_device)
         self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
         serialized_av = target._serialized_target_artifacts[str(profile_a.pk)]["versions"][str(profile_av.pk)]
         self.assertEqual(
             serialized_av,
-            (TargetArtifact.Status.UNINSTALLED, None, (0, 0, 0))
+            (TargetArtifact.Status.UNINSTALLED, None, (0, 0, 0), 0)
         )
 
     @patch("zentral.contrib.mdm.artifacts.datetime")
-    def test_update_target_artifacts_from_status_report_failed(self, patched_datetime):
+    def test_update_target_artifacts_from_status_report_valid_unknown_no_retry(self, patched_datetime):
         patched_datetime.utcnow.return_value = datetime(2001, 2, 3, 4, 5, 6)
         _, profile_a, (profile_av,) = self._force_blueprint_artifact()
-        status_report = self._build_status_report([(profile_av, False, False)])
+        status_report = self._build_status_report([(profile_av, "unknown", True, None)])
+        target = Target(self.enrolled_device)
+        self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
+        serialized_av = target._serialized_target_artifacts[str(profile_a.pk)]["versions"][str(profile_av.pk)]
+        self.assertEqual(
+            serialized_av,
+            (TargetArtifact.Status.AWAITING_CONFIRMATION, None, (0, 0, 0), 0)
+        )
+
+    @patch("zentral.contrib.mdm.artifacts.datetime")
+    def test_update_target_artifacts_from_status_report_failed_then_installed(self, patched_datetime):
+        patched_datetime.utcnow.side_effect = [datetime(2001, 2, 3, 4, 5, 6), datetime(2002, 3, 4, 5, 6, 7)]
+        _, profile_a, (profile_av,) = self._force_blueprint_artifact()
+        # failed
+        reasons = [{"details": {"Error": "Yolo Fomo"},
+                    "description": "Configuration cannot be applied",
+                    "code": "Error.ConfigurationCannotBeApplied"}]
+        status_report = self._build_status_report([(profile_av, False, True, reasons)])
         self.enrolled_device.os_version = "10.5.2"
         target = Target(self.enrolled_device)
         self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
         serialized_av = target._serialized_target_artifacts[str(profile_a.pk)]["versions"][str(profile_av.pk)]
         self.assertEqual(
             serialized_av,
-            (TargetArtifact.Status.FAILED, None, (0, 0, 0))
+            (TargetArtifact.Status.FAILED, None, (0, 0, 0), 1)
+        )
+        self.assertEqual(
+            DeviceArtifact.objects.get(artifact_version=profile_av).extra_info,
+            {"reasons": reasons,
+             "valid": "invalid",
+             "active": True}
+        )
+        # installed
+        status_report = self._build_status_report([(profile_av, True, True, None)])
+        target = Target(self.enrolled_device)
+        self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
+        serialized_av = target._serialized_target_artifacts[str(profile_a.pk)]["versions"][str(profile_av.pk)]
+        self.assertEqual(
+            serialized_av,
+            (TargetArtifact.Status.INSTALLED, datetime(2002, 3, 4, 5, 6, 7), (10, 5, 2), 1)
+        )
+        self.assertEqual(
+            DeviceArtifact.objects.get(artifact_version=profile_av).extra_info,
+            {"valid": "valid",
+             "active": True}
         )
 
     def test_update_target_artifacts_from_status_report_cleanup(self):
@@ -1311,8 +1668,30 @@ class TestMDMArtifacts(TestCase):
             1
         )
         status_report = self._build_status_report([])
+        target = Target(self.enrolled_device)
         self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
         self.assertEqual(DeviceArtifact.objects.filter(enrolled_device=self.enrolled_device).count(), 0)
+
+    def test_update_target_artifacts_from_status_report_cleanup_two_then_one(self):
+        _, profile_a, (profile_av,) = self._force_blueprint_artifact()
+        _, profile_b, (profile_bv,) = self._force_blueprint_artifact()
+        # 2 installed
+        status_report = self._build_status_report([(profile_av, True, True, None),
+                                                   (profile_bv, True, True, None)])
+        target = Target(self.enrolled_device)
+        self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
+        self.assertEqual(
+            set(target._serialized_target_artifacts.keys()),
+            set(str(a.pk) for a in (profile_a, profile_b))
+        )
+        # 1 installed
+        status_report = self._build_status_report([(profile_bv, True, True, None)])
+        target = Target(self.enrolled_device)
+        self.assertTrue(target.update_target_artifacts_with_status_report(status_report) is True)
+        self.assertEqual(
+            set(target._serialized_target_artifacts.keys()),
+            set(str(a.pk) for a in (profile_b,))
+        )
 
     def test_update_target_artifacts_from_status_report_missing_configurations_noop(self):
         _, profile_a, (profile_av,) = self._force_blueprint_artifact()
@@ -1395,6 +1774,7 @@ class TestMDMArtifacts(TestCase):
         # first time, device notified
         with self.captureOnCommitCallbacks(execute=True) as callbacks:
             target.update_target_with_status_report(status_report)
+        self.assertEqual(len(callbacks), 1)
         send_enrolled_device_notification.assert_called_once_with(self.enrolled_device)
         self.assertEqual(target.client_capabilities,
                          status_report["StatusItems"]["management"]["client-capabilities"])
@@ -1416,6 +1796,7 @@ class TestMDMArtifacts(TestCase):
         # first time, device notified
         with self.captureOnCommitCallbacks(execute=True) as callbacks:
             target.update_target_with_status_report(status_report)
+        self.assertEqual(len(callbacks), 1)
         send_enrolled_user_notification.assert_called_once_with(self.enrolled_user)
         self.assertEqual(target.client_capabilities,
                          status_report["StatusItems"]["management"]["client-capabilities"])

@@ -1,4 +1,5 @@
 from datetime import datetime
+from functools import partial
 import logging
 from importlib import import_module
 import uuid
@@ -8,7 +9,6 @@ from django.db.models import Q
 import django.dispatch
 from django.urls import reverse
 from django.utils.functional import cached_property
-from zentral.contrib.inventory.models import Tag
 from accounts.models import User
 from .backends.registry import backend_classes
 
@@ -19,7 +19,14 @@ logger = logging.getLogger('zentral.realms.models')
 class Realm(models.Model):
     uuid = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
-    enabled_for_login = models.BooleanField(default=False)
+    enabled_for_login = models.BooleanField(
+        default=False,
+        help_text="If True, users will be able to sign in to the Zentral admin console"
+    )
+    user_portal = models.BooleanField(
+        default=False,
+        help_text="If True, users will be able to sign in to this realm user portal",
+    )
     login_session_expiry = models.PositiveIntegerField(null=True, default=0)
 
     # backend + backend config
@@ -53,6 +60,16 @@ class Realm(models.Model):
         if backend_class:
             return backend_class(self)
 
+    def _get_BACKEND_config(self, backend):
+        if self.backend == backend:
+            return self.config
+
+    def __getattr__(self, name):
+        for backend in backend_classes:
+            if name == f"get_{backend}_config":
+                return partial(self._get_BACKEND_config, backend)
+        raise AttributeError
+
     def get_absolute_url(self):
         return reverse("realms:view", args=(self.uuid,))
 
@@ -61,6 +78,37 @@ class Realm(models.Model):
                            "first_name", "last_name", "full_name",
                            "custom_attr_1", "custom_attr_2"):
             yield user_claim, getattr(self, "{}_claim".format(user_claim))
+
+    def serialize_for_event(self, keys_only=False):
+        d = {"pk": str(self.pk),
+             "name": self.name}
+        if keys_only:
+            return d
+        d.update({
+            "enabled_for_login": self.enabled_for_login,
+            "login_session_expiry": self.login_session_expiry,
+            "backend": self.backend,
+            "config": self.config,
+            "username_claim": self.username_claim,
+            "email_claim": self.email_claim,
+            "first_name_claim": self.first_name_claim,
+            "last_name_claim": self.last_name_claim,
+            "full_name_claim": self.full_name_claim,
+            "custom_attr_1_claim": self.custom_attr_1_claim,
+            "custom_attr_2_claim": self.custom_attr_2_claim,
+            "scim_enabled": self.scim_enabled,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        })
+        return d
+
+
+class RealmGroupManager(models.Manager):
+    def for_deletion(self):
+        return self.filter(scim_external_id__isnull=True)
+
+    def for_update(self):
+        return self.filter(scim_external_id__isnull=True)
 
 
 class RealmGroup(models.Model):
@@ -76,15 +124,40 @@ class RealmGroup(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = RealmGroupManager()
+
     class Meta:
         unique_together = (("realm", "display_name"),
                            ("realm", "scim_external_id"),)
 
     def __str__(self):
-        return self.display_name
+        return f"{self.realm} / {self.display_name}"
 
     def get_absolute_url(self):
         return reverse("realms:group", args=(self.pk,))
+
+    def serialize_for_event(self, keys_only=False):
+        d = {"pk": str(self.pk),
+             "realm": self.realm.serialize_for_event(keys_only=True),
+             "display_name": self.display_name}
+        if keys_only:
+            return d
+        d.update({
+            "scim_external_id": self.scim_external_id,
+            "parent": self.parent.serialize_for_event(keys_only=True) if self.parent else None,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        })
+        return d
+
+    def can_be_deleted(self):
+        return RealmGroup.objects.for_deletion().filter(pk=self.pk).exists()
+
+    def can_be_updated(self):
+        return RealmGroup.objects.for_update().filter(pk=self.pk).exists()
+
+    def scim_managed(self):
+        return self.scim_external_id is not None
 
 
 class RealmUser(models.Model):
@@ -161,7 +234,7 @@ class RealmUser(models.Model):
 
     # groups
 
-    def scim_groups(self):
+    def iter_raw_groups(self):
         sql = (
             "WITH RECURSIVE groups(value, display, type, parent_id) AS ("
             "  SELECT rg.uuid, rg.display_name, 'direct' type, rg.parent_id"
@@ -181,35 +254,40 @@ class RealmUser(models.Model):
             yield dict(zip(columns, result))
 
     def groups_with_types(self):
-        scim_groups = {sg["value"]: sg["type"] for sg in self.scim_groups()}
+        raw_groups = {sg["value"]: sg["type"] for sg in self.iter_raw_groups()}
         groups_with_types = []
-        for realm_group in RealmGroup.objects.filter(pk__in=scim_groups.keys()).order_by("display_name"):
-            groups_with_types.append((realm_group, scim_groups[realm_group.pk]))
+        for realm_group in RealmGroup.objects.filter(pk__in=raw_groups.keys()).order_by("display_name"):
+            groups_with_types.append((realm_group, raw_groups[realm_group.pk]))
         return groups_with_types
 
-    def iter_group_names(self):
-        for scim_group in self.scim_groups():
-            yield scim_group["display"]
-
-    def mapped_tags(self):
-        group_names = [  # not a set, because the number should be small
-            group_name.lower()
-            for group_name in self.iter_group_names()
-        ]
-        tags_to_add = []
-        tags_to_remove = []
-        for tm in self.realm.realmtagmapping_set.select_related("tag").all():
-            if tm.group_name.lower() in group_names:
-                tags_to_add.append(tm.tag)
-            else:
-                tags_to_remove.append(tm.tag)
-        return tags_to_add, tags_to_remove
+    def serialize_for_event(self, keys_only=False):
+        d = {
+            "pk": str(self.uuid),
+            "realm": self.realm.serialize_for_event(keys_only=True),
+            "username": self.username,
+        }
+        if keys_only:
+            return d
+        for attr in ("username",
+                     "email",
+                     "first_name",
+                     "last_name",
+                     "full_name",
+                     "custom_attr_1",
+                     "custom_attr_2"):
+            val = getattr(self, attr)
+            if val:
+                d[attr] = val
+        return d
 
 
 class RealmUserGroupMembership(models.Model):
     user = models.ForeignKey(RealmUser, on_delete=models.CASCADE)
     group = models.ForeignKey(RealmGroup, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+realm_group_members_updated = django.dispatch.Signal()
 
 
 class RealmEmail(models.Model):
@@ -303,28 +381,34 @@ class RealmAuthenticationSession(models.Model):
 
 class RealmGroupMapping(models.Model):
     uuid = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
     claim = models.CharField(max_length=255)
     separator = models.CharField(max_length=64, blank=True)
     value = models.CharField(max_length=255)
-    group = models.ForeignKey(Group, on_delete=models.CASCADE)
+    realm_group = models.ForeignKey(RealmGroup, on_delete=models.CASCADE, verbose_name="Group")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = (("realm", "claim", "value", "group"),)
+        unique_together = (("claim", "value", "realm_group"),)
+
+    def __str__(self):
+        return f"{self.claim} → {self.realm_group}"
+
+    def get_absolute_url(self):
+        return reverse("realms:realm_group_mappings") + f"#{str(self.pk)}"
 
 
-class RealmTagMapping(models.Model):
+class RoleMapping(models.Model):
     uuid = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    realm = models.ForeignKey(Realm, on_delete=models.CASCADE)
-    group_name = models.CharField(max_length=255)
-    tag = models.ForeignKey(Tag, on_delete=models.CASCADE)
+    realm_group = models.ForeignKey(RealmGroup, on_delete=models.CASCADE, verbose_name="Group")
+    group = models.ForeignKey(Group, on_delete=models.CASCADE, verbose_name="Role")
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = (("realm", "group_name", "tag"),)
+        unique_together = (("realm_group", "group"),)
 
+    def __str__(self):
+        return f"{self.realm_group} → {self.group}"
 
-realm_tagging_change = django.dispatch.Signal()
+    def get_absolute_url(self):
+        return reverse("realms:role_mappings") + f"#{str(self.pk)}"

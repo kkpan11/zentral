@@ -1,8 +1,11 @@
 from datetime import datetime
 from django.utils.crypto import get_random_string
+from tests.munki.utils import force_enrollment as force_munki_enrollment
+from tests.osquery.utils import force_enrollment as force_osquery_enrollment
 from zentral.contrib.inventory.models import EnrollmentSecret, MetaBusinessUnit, Tag
 from zentral.contrib.monolith.models import (Catalog, Condition, Enrollment,
-                                             Manifest, ManifestCatalog, ManifestSubManifest,
+                                             Manifest, ManifestCatalog,
+                                             ManifestEnrollmentPackage, ManifestSubManifest,
                                              PkgInfo, PkgInfoCategory, PkgInfoName,
                                              SubManifest, SubManifestPkgInfo,
                                              Repository, RepositoryBackend)
@@ -19,8 +22,15 @@ Y5iiw7n52shShyNTBggl3Xp8BILhfrIgGJ6o8jOQwA==
 -----END RSA PRIVATE KEY-----"""
 
 
-def force_repository(mbu=None, virtual=False, secret_access_key=None, cloudfront_privkey_pem=None):
+def force_repository(
+    mbu=None,
+    virtual=False,
+    secret_access_key=None,
+    cloudfront_privkey_pem=None,
+    provisioning_uid=None
+):
     r = Repository.objects.create(
+        provisioning_uid=provisioning_uid,
         name=get_random_string(12),
         meta_business_unit=mbu,
         backend=RepositoryBackend.VIRTUAL if virtual else RepositoryBackend.S3,
@@ -90,7 +100,7 @@ def force_category(repository=None, name=None):
 
 
 def force_name(name=None):
-    return PkgInfoName.objects.create(name=name or get_random_string(12))
+    return PkgInfoName.objects.get_or_create(name=name or get_random_string(12))[0]
 
 
 def _force_pkg_info(
@@ -101,8 +111,9 @@ def _force_pkg_info(
     sub_manifest=None,
     options=None,
     condition=None,
+    name=None,
 ):
-    pkg_info_name = force_name()
+    pkg_info_name = force_name(name=name)
     data = {"name": pkg_info_name.name,
             "version": version}
     if catalog is None:
@@ -153,3 +164,31 @@ def force_enrollment(mbu=None, tag_count=0):
         Enrollment.objects.create(manifest=force_manifest(mbu=mbu), secret=enrollment_secret),
         tags
     )
+
+
+def force_manifest_enrollment_package(manifest=None, tags=None, module="munki", catalog=None):
+    if not manifest:
+        manifest = force_manifest()
+    if module == "munki":
+        enrollment = force_munki_enrollment(meta_business_unit=manifest.meta_business_unit)
+        builder = "zentral.contrib.munki.osx_package.builder.MunkiZentralEnrollPkgBuilder"
+    elif module == "osquery":
+        enrollment = force_osquery_enrollment(meta_business_unit=manifest.meta_business_unit)
+        builder = "zentral.contrib.osquery.osx_package.builder.OsqueryZentralEnrollPkgBuilder"
+    else:
+        ValueError("Unknown module")
+    mep = ManifestEnrollmentPackage.objects.create(
+        manifest=manifest,
+        builder=builder,
+        enrollment_pk=enrollment.pk
+    )
+    enrollment.distributor = mep
+    enrollment.save()
+    if not tags:
+        tags = []
+    mep.tags.set(tags)
+    if catalog:
+        _force_pkg_info(name=mep.get_name(), catalog=catalog)
+        for required_pkg_name in mep.get_requires():
+            _force_pkg_info(name=required_pkg_name, catalog=catalog)
+    return mep

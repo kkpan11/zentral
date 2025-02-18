@@ -1,25 +1,32 @@
 from datetime import date, datetime, time, timedelta
 import hashlib
+import io
+import json
 import os.path
 import plistlib
+from unittest.mock import patch
+import zipfile
 import uuid
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils.crypto import get_random_string
-from realms.models import Realm, RealmUser
-from zentral.contrib.inventory.models import EnrollmentSecret
+from realms.models import Realm, RealmGroup, RealmUser
+from zentral.contrib.inventory.models import EnrollmentSecret, MetaBusinessUnit, Tag
 from zentral.contrib.mdm.artifacts import update_blueprint_serialized_artifacts
 from zentral.contrib.mdm.crypto import load_push_certificate_and_key
+from zentral.contrib.mdm.declarations import get_declaration_info
 from zentral.contrib.mdm.models import (Artifact, ArtifactVersion, Asset,
                                         Blueprint, BlueprintArtifact,
-                                        Channel, Platform,
+                                        Channel, DataAsset, Declaration, DeclarationRef, Platform,
                                         DEPDevice, DEPEnrollment, DEPEnrollmentSession, DEPOrganization, DEPToken,
                                         DEPVirtualServer, EnrolledDevice, EnrolledUser,
                                         EnterpriseApp, FileVaultConfig, Location, LocationAsset,
                                         OTAEnrollment, OTAEnrollmentSession,
                                         Profile, PushCertificate, RecoveryPasswordConfig, SCEPConfig,
+                                        RealmGroupTagMapping,
                                         SoftwareUpdate, SoftwareUpdateDeviceID, SoftwareUpdateEnforcement,
                                         StoreApp,
                                         UserEnrollment, UserEnrollmentSession)
@@ -39,11 +46,11 @@ def force_realm():
     )
 
 
-def force_realm_user(realm=None):
+def force_realm_user(realm=None, username=None, email=None):
     if not realm:
         realm = force_realm()
-    username = get_random_string(12)
-    email = f"{username}@example.com"
+    username = username or get_random_string(12)
+    email = email or f"{username}@example.com"
     realm_user = RealmUser.objects.create(
         realm=realm,
         claims={"username": username,
@@ -54,14 +61,38 @@ def force_realm_user(realm=None):
     return realm, realm_user
 
 
+def force_realm_group(realm=None, parent=None):
+    if realm is None:
+        realm = force_realm()
+    return RealmGroup.objects.create(
+        realm=realm,
+        display_name=get_random_string(12),
+    )
+
+
+def force_realm_group_tag_mapping(realm=None, realm_group=None, tag=None):
+    if realm_group is None:
+        realm_group = force_realm_group(realm=realm)
+    if tag is None:
+        tag = Tag.objects.create(name=get_random_string(12))
+    return RealmGroupTagMapping.objects.create(
+        realm_group=realm_group,
+        tag=tag,
+    )
+
 # push certificate
 
 
-def force_push_certificate_material(topic=None, reduced_key_size=True):
-    privkey = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=512 if reduced_key_size else 2048,
-    )  # lgtm[py/weak-crypto-key]
+def force_push_certificate_material(topic=None, reduced_key_size=True, encrypt_key=True, privkey_bytes=None):
+    if privkey_bytes:
+        privkey = serialization.load_pem_private_key(privkey_bytes, None)
+    else:
+        with patch('cryptography.hazmat.primitives.asymmetric.rsa._verify_rsa_parameters') as _verify_rsa_parameters:
+            _verify_rsa_parameters.return_value = True  # to allow reduced_key_size !!!
+            privkey = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=512 if reduced_key_size else 2048,
+            )  # lgtm[py/weak-crypto-key]
     builder = x509.CertificateBuilder()
     name = get_random_string(12)
     if topic is None:
@@ -83,21 +114,32 @@ def force_push_certificate_material(topic=None, reduced_key_size=True):
     cert_pem = cert.public_bytes(
         encoding=serialization.Encoding.PEM
     )
-    privkey_password = get_random_string(12).encode("utf-8")
+    if encrypt_key:
+        privkey_password = get_random_string(12).encode("utf-8")
+        encryption_algorithm = serialization.BestAvailableEncryption(privkey_password)
+    else:
+        privkey_password = None
+        encryption_algorithm = serialization.NoEncryption()
     privkey_pem = privkey.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.BestAvailableEncryption(privkey_password)
+        encryption_algorithm=encryption_algorithm,
     )
     return cert_pem, privkey_pem, privkey_password
 
 
-def force_push_certificate(topic=None, with_material=False, reduced_key_size=True, commit=True):
+def force_push_certificate(
+    topic=None,
+    with_material=False,
+    reduced_key_size=True,
+    commit=True,
+    provisioning_uid=None,
+):
     if topic is None:
         topic = get_random_string(12)
     name = get_random_string(12)
     if with_material:
-        push_certificate = PushCertificate(name=name)
+        push_certificate = PushCertificate.objects.create(provisioning_uid=provisioning_uid, name=name)
         cert_pem, privkey_pem, privkey_password = force_push_certificate_material(topic, reduced_key_size)
         for k, v in load_push_certificate_and_key(cert_pem, privkey_pem, privkey_password).items():
             if k == "private_key":
@@ -105,11 +147,12 @@ def force_push_certificate(topic=None, with_material=False, reduced_key_size=Tru
             else:
                 setattr(push_certificate, k, v)
     else:
-        push_certificate = PushCertificate(
+        push_certificate = PushCertificate.objects.create(
+            provisioning_uid=provisioning_uid,
             name=name,
             topic=topic,
-            not_before="2000-01-01",
-            not_after="2040-01-01",
+            not_before=datetime(2000, 1, 1),
+            not_after=datetime(2040, 1, 1),
             certificate=b"1",
         )
         push_certificate.set_private_key(b"2")
@@ -121,8 +164,9 @@ def force_push_certificate(topic=None, with_material=False, reduced_key_size=Tru
 # SCEP config
 
 
-def force_scep_config():
+def force_scep_config(provisioning_uid=None):
     scep_config = SCEPConfig(
+        provisioning_uid=provisioning_uid,
         name=get_random_string(12),
         url="https://example.com/{}".format(get_random_string(12)),
         challenge_type="STATIC",
@@ -206,37 +250,45 @@ def force_dep_device(
 # enrollments
 
 
-def force_dep_enrollment(mbu, push_certificate=None):
+def force_dep_enrollment(mbu, push_certificate=None, display_name=None, tags=None):
     if push_certificate is None:
         push_certificate = force_push_certificate()
+    enrollment_secret = EnrollmentSecret.objects.create(meta_business_unit=mbu)
+    if tags:
+        enrollment_secret.tags.set(tags)
     return DEPEnrollment.objects.create(
+        display_name=display_name or get_random_string(12),
         name=get_random_string(12),
         uuid=uuid.uuid4(),
         push_certificate=push_certificate,
         scep_config=force_scep_config(),
         virtual_server=force_dep_virtual_server(),
-        enrollment_secret=EnrollmentSecret.objects.create(meta_business_unit=mbu),
+        enrollment_secret=enrollment_secret,
         skip_setup_items=[k for k, _ in skippable_setup_panes],
     )
 
 
-def force_ota_enrollment(mbu, realm=None):
+def force_ota_enrollment(mbu=None, realm=None, display_name=None):
+    if mbu is None:
+        mbu = MetaBusinessUnit.objects.create(name=get_random_string(12))
     return OTAEnrollment.objects.create(
         push_certificate=force_push_certificate(),
         scep_config=force_scep_config(),
         name=get_random_string(12),
         enrollment_secret=EnrollmentSecret.objects.create(meta_business_unit=mbu),
         realm=realm,
+        display_name=display_name or get_random_string(12),
     )
 
 
-def force_user_enrollment(mbu, realm=None):
+def force_user_enrollment(mbu, realm=None, enrollment_display_name=None):
     return UserEnrollment.objects.create(
         push_certificate=force_push_certificate(),
         realm=realm or force_realm(),
         scep_config=force_scep_config(),
         name=get_random_string(12),
-        enrollment_secret=EnrollmentSecret.objects.create(meta_business_unit=mbu)
+        enrollment_secret=EnrollmentSecret.objects.create(meta_business_unit=mbu),
+        display_name=enrollment_display_name or get_random_string(12)
     )
 
 
@@ -297,8 +349,16 @@ def force_dep_enrollment_session(
     device_udid=None,
     serial_number=None,
     realm_user=False,
+    realm_user_email=None,
+    realm_user_username=None,
+    enrollment_display_name=None,
+    tags=None
 ):
-    dep_enrollment = force_dep_enrollment(mbu, push_certificate)
+    dep_enrollment = force_dep_enrollment(mbu, push_certificate, display_name=enrollment_display_name, tags=tags)
+    if realm_user:
+        dep_enrollment.use_realm_user = True
+        dep_enrollment.username_pattern = DEPEnrollment.UsernamePattern.DEVICE_USERNAME
+        dep_enrollment.save()
     if serial_number is None:
         serial_number = get_random_string(12)
     if device_udid is None:
@@ -307,7 +367,8 @@ def force_dep_enrollment_session(
         dep_enrollment, serial_number, device_udid
     )
     if realm_user:
-        session.dep_enrollment.realm, session.realm_user = force_realm_user()
+        session.dep_enrollment.realm, session.realm_user = force_realm_user(email=realm_user_email,
+                                                                            username=realm_user_username)
         session.dep_enrollment.use_realm_user = True
         session.dep_enrollment.save()
         session.save()
@@ -514,6 +575,66 @@ def force_blueprint(filevault_config=None, recovery_password_config=None, softwa
     return bp
 
 
+def force_asset():
+    return Asset.objects.create(
+        adam_id=get_random_string(12),
+        pricing_param=get_random_string(12),
+        product_type=Asset.ProductType.APP,
+        device_assignable=True,
+        revocable=True,
+        supported_platforms=["iOS", "macOS"]
+    )
+
+
+def force_location(name=None, organization_name=None):
+    location = Location(
+        server_token_hash=get_random_string(40, allowed_chars='abcdef0123456789'),
+        server_token=get_random_string(12),
+        server_token_expiration_date=date(2050, 1, 1),
+        organization_name=organization_name or get_random_string(12),
+        country_code="DE",
+        library_uid=str(uuid.uuid4()),
+        name=name or get_random_string(12),
+        platform="enterprisestore",
+        website_url="https://business.apple.com",
+        mdm_info_id=uuid.uuid4(),
+    )
+    location.set_notification_auth_token()
+    location.save()
+    return location
+
+
+def force_location_asset(asset=None, location=None):
+    return LocationAsset.objects.create(
+        asset=asset or force_asset(),
+        location=location or force_location()
+    )
+
+
+def build_plistfile(filename=None):
+    if filename is None:
+        filename = "{}.plist".format(get_random_string(17))
+    plist_buffer = io.BytesIO()
+    plistlib.dump({"un": 2}, plist_buffer)
+    plist_buffer.name = filename
+    plist_buffer.seek(0)
+    return plist_buffer
+
+
+def build_zipfile(filename=None, random=False):
+    extra = ""
+    if random:
+        extra = get_random_string(12)
+    if filename is None:
+        filename = "{}.zip".format(get_random_string(17))
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        zip_file.writestr("etc/sudoers", f"Defaults log_allowed\nDefaults timestamp_timeout=0{extra}")
+    zip_buffer.name = filename
+    zip_buffer.seek(0)
+    return zip_buffer
+
+
 def force_artifact(
     version_count=1,
     artifact_type=Artifact.Type.PROFILE,
@@ -522,6 +643,9 @@ def force_artifact(
     install_during_setup_assistant=False,
     auto_update=True,
     requires=None,
+    decl_identifier=None,
+    decl_type=None,
+    decl_payload=None,
 ):
     if platforms is None:
         platforms = [Platform.MACOS]
@@ -573,46 +697,51 @@ def force_artifact(
                 payload_description=payload_description
             )
         elif artifact_type == Artifact.Type.ENTERPRISE_APP:
+            filename = "{}.pkg".format(get_random_string(17))
             EnterpriseApp.objects.create(
                 artifact_version=artifact_version,
                 package_sha256=64 * "0",
-                package_size=123,
-                filename="{}.pkg".format(get_random_string(17)),
+                package_size=8,
+                package=SimpleUploadedFile(name=filename, content=b"yolofomo"),
+                filename=filename,
                 product_id="{}.{}.{}".format(get_random_string(2), get_random_string(4), get_random_string(8)),
                 product_version="17",
                 manifest={"items": [{"assets": [{}]}]}
             )
         elif artifact_type == Artifact.Type.STORE_APP:
-            asset = Asset.objects.create(
-                adam_id="1234567890",
-                pricing_param="STDQ",
-                product_type=Asset.ProductType.APP,
-                device_assignable=True,
-                revocable=True,
-                supported_platforms=[Platform.MACOS]
-            )
-            location = Location(
-                server_token_hash=get_random_string(40, allowed_chars='abcdef0123456789'),
-                server_token=get_random_string(12),
-                server_token_expiration_date=date(2050, 1, 1),
-                organization_name=get_random_string(12),
-                country_code="DE",
-                library_uid=str(uuid.uuid4()),
-                name=get_random_string(12),
-                platform="enterprisestore",
-                website_url="https://business.apple.com",
-                mdm_info_id=uuid.uuid4(),
-            )
-            location.set_notification_auth_token()
-            location.save()
-            location_asset = LocationAsset.objects.create(
-                asset=asset,
-                location=location
-            )
             StoreApp.objects.create(
                 artifact_version=artifact_version,
-                location_asset=location_asset
+                location_asset=force_location_asset(),
             )
+        elif artifact_type == Artifact.Type.DATA_ASSET:
+            zipfile = build_zipfile()
+            content = zipfile.getvalue()
+            DataAsset.objects.create(
+                artifact_version=artifact_version,
+                type=DataAsset.Type.ZIP,
+                file=SimpleUploadedFile(name=zipfile.name, content=content),
+                filename=zipfile.name,
+                file_size=len(content),
+                file_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        elif artifact_type.is_raw_declaration:
+            if decl_payload is None:
+                decl_payload = {"Restrictions": {"ExternalStorage": "Disallowed", "NetworkStorage": "Disallowed"}}
+            declaration = Declaration.objects.create(
+                artifact_version=artifact_version,
+                type=decl_type or "com.apple.configuration.diskmanagement.settings",
+                identifier=decl_identifier or str(uuid.uuid4()),
+                server_token=str(uuid.uuid4()),
+                payload=decl_payload or decl_payload
+            )
+            try:
+                info = get_declaration_info(json.dumps(declaration.get_full_dict()), channel, platforms)
+            except ValueError:
+                # because of the tests, it might not always work!
+                pass
+            else:
+                for path, ref_artifact in info["refs"].items():
+                    DeclarationRef.objects.create(declaration=declaration, key=path, artifact=ref_artifact)
     return artifact, artifact_versions
 
 
@@ -625,6 +754,9 @@ def force_blueprint_artifact(
     auto_update=True,
     requires=None,
     blueprint=None,
+    decl_identifier=None,
+    decl_type=None,
+    decl_payload=None,
 ):
     artifact, artifact_versions = force_artifact(
         version_count,
@@ -634,6 +766,9 @@ def force_blueprint_artifact(
         install_during_setup_assistant,
         auto_update,
         requires,
+        decl_identifier,
+        decl_type,
+        decl_payload,
     )
     if not blueprint:
         blueprint = force_blueprint()

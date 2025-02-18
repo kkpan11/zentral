@@ -18,7 +18,7 @@ class ManagedApplicationList(Command):
                 or enrolled_device.platform == Platform.MACOS
             ) and (
                 not enrolled_device.user_enrollment
-                or enrolled_device.platform in (Platform.IOS, Platform.MACOS)
+                or enrolled_device.platform in (Platform.IOS, Platform.IPADOS, Platform.MACOS)
             )
         )
 
@@ -63,7 +63,7 @@ class ManagedApplicationList(Command):
                 self.artifact_version,
                 ta_status,
                 extra_info=extra_info,
-                allow_reinstall=True,
+                unique_install_identifier=self.uuid,
             )
         if not found:
             logger.warning("Artifact version %s was not found on device %s.",
